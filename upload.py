@@ -6,7 +6,9 @@ Uses parallel transfers for speed and reads connection info from SSH config
 
 import argparse
 import configparser
+import json
 import os
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,6 +58,54 @@ class SSHConfig:
         raise ValueError(f"Host '{host}' not found in SSH config")
 
 
+def _load_vast_instance_for_host(hostname: str) -> Optional[dict]:
+    try:
+        result = subprocess.run(
+            ["vastai", "show", "instances", "--raw"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+    try:
+        instances = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(instances, list):
+        return None
+
+    running = [inst for inst in instances if inst.get("actual_status") == "running"]
+    for inst in running:
+        if inst.get("public_ipaddr") == hostname:
+            return inst
+
+    if len(running) == 1:
+        return running[0]
+
+    return None
+
+
+def _resolve_vast_port(hostname: str, container_port: int) -> Optional[str]:
+    inst = _load_vast_instance_for_host(hostname)
+    if not inst:
+        return None
+
+    ports = inst.get("ports", {})
+    key = f"{container_port}/tcp"
+    entries = ports.get(key) or []
+    if not entries:
+        return None
+
+    host_port = entries[0].get("HostPort")
+    if not host_port:
+        return None
+
+    return str(host_port)
+
+
 class FileUploader:
     """Fast parallel file uploader using rsync over SSH"""
 
@@ -77,10 +127,16 @@ class FileUploader:
 
     def _build_ssh_args(self) -> str:
         """Build SSH arguments for rsync"""
-        ssh_args = f"ssh -p {self.port}"
+        ssh_bin = shutil.which("hpnssh")
+        if not ssh_bin:
+            raise RuntimeError("hpnssh not found; install HPN-SSH to upload.")
+        ssh_args = f"{ssh_bin} -p {self.port}"
         if self.identity:
             ssh_args += f" -i {self.identity}"
-        ssh_args += " -o StrictHostKeyChecking=no -o BatchMode=yes"
+        ssh_args += (
+            " -o StrictHostKeyChecking=no -o BatchMode=yes"
+            " -o Compression=no -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"
+        )
         return ssh_args
 
     def upload_file(
@@ -100,8 +156,9 @@ class FileUploader:
         # Build rsync command
         cmd = [
             "rsync",
-            "-az",  # archive mode, compressed
-            "--progress",
+            "-a",  # archive mode, no compression for speed on PNGs
+            "--info=progress2",
+            "--skip-compress=png,jpg,jpeg,webp,gif,mp4,mkv,zip,7z",
             "-e",
             self._build_ssh_args(),
             str(local_path),
@@ -138,8 +195,9 @@ class FileUploader:
 
         cmd = [
             "rsync",
-            "-avz",  # archive, verbose, compressed
-            "--progress",
+            "-av",  # archive, verbose, no compression for speed on PNGs
+            "--info=progress2",
+            "--skip-compress=png,jpg,jpeg,webp,gif,mp4,mkv,zip,7z",
             "-e",
             self._build_ssh_args(),
         ]
@@ -208,6 +266,15 @@ Examples:
 
     args = parser.parse_args()
 
+    if not shutil.which("hpnssh"):
+        print("❌ hpnssh not found on PATH.")
+        print("💡 Install HPN-SSH to use the uploader.")
+        sys.exit(1)
+    if not shutil.which("rsync"):
+        print("❌ rsync not found on PATH.")
+        print("💡 Install rsync to use the uploader.")
+        sys.exit(1)
+
     # Get connection info from SSH config
     try:
         ssh_config = SSHConfig()
@@ -218,11 +285,20 @@ Examples:
         user = host_info.get("user", "user")
         identity = host_info.get("identity", "")
 
+        if shutil.which("hpnssh"):
+            mapped_port = _resolve_vast_port(hostname, 2222)
+            if mapped_port:
+                if mapped_port != str(port):
+                    print(
+                        f"ℹ️ Using Vast.ai mapped port {mapped_port} for container port 2222"
+                    )
+                port = mapped_port
+
         print(f"🔗 Connecting to {user}@{hostname}:{port}")
 
     except Exception as e:
         print(f"❌ Error reading SSH config: {e}")
-        print(f"\n💡 Make sure you've run ./launch_host.sh first to set up SSH config")
+        print("\n💡 Make sure your SSH config has the correct host/port entry")
         sys.exit(1)
 
     # Create uploader

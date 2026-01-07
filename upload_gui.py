@@ -7,6 +7,7 @@ Qt-based UI with drag-and-drop uploads and remote file browser.
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -76,6 +77,54 @@ class SSHConfig:
         return hosts
 
 
+def _load_vast_instance_for_host(hostname: str) -> Optional[dict]:
+    try:
+        result = subprocess.run(
+            ["vastai", "show", "instances", "--raw"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+    try:
+        instances = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(instances, list):
+        return None
+
+    running = [inst for inst in instances if inst.get("actual_status") == "running"]
+    for inst in running:
+        if inst.get("public_ipaddr") == hostname:
+            return inst
+
+    if len(running) == 1:
+        return running[0]
+
+    return None
+
+
+def _resolve_vast_port(hostname: str, container_port: int) -> Optional[str]:
+    inst = _load_vast_instance_for_host(hostname)
+    if not inst:
+        return None
+
+    ports = inst.get("ports", {})
+    key = f"{container_port}/tcp"
+    entries = ports.get(key) or []
+    if not entries:
+        return None
+
+    host_port = entries[0].get("HostPort")
+    if not host_port:
+        return None
+
+    return str(host_port)
+
+
 class RemoteFileSystem:
     """Handle remote filesystem operations via SSH"""
 
@@ -91,8 +140,11 @@ class RemoteFileSystem:
 
     def _run_ssh_command(self, command: str) -> str:
         """Execute command on remote host"""
+        ssh_bin = shutil.which("hpnssh")
+        if not ssh_bin:
+            raise Exception("hpnssh not found; install HPN-SSH to use the uploader.")
         ssh_cmd = [
-            "ssh",
+            ssh_bin,
             "-p",
             self.port,
             "-o",
@@ -205,34 +257,17 @@ class FileUploader:
 
     def _build_ssh_args(self) -> str:
         """Build SSH arguments for rsync"""
-        ssh_args = f"ssh -p {self.port}"
+        ssh_bin = shutil.which("hpnssh")
+        if not ssh_bin:
+            raise RuntimeError("hpnssh not found; install HPN-SSH to use the uploader.")
+        ssh_args = f"{ssh_bin} -p {self.port}"
         if self.identity:
             ssh_args += f" -i {self.identity}"
-        ssh_args += " -o StrictHostKeyChecking=no -o BatchMode=yes"
+        ssh_args += (
+            " -o StrictHostKeyChecking=no -o BatchMode=yes"
+            " -o Compression=no -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"
+        )
         return ssh_args
-
-    def _upload_via_scp(
-        self, local_path: Path, remote_path: str, progress_callback=None
-    ) -> bool:
-        """Fallback upload using scp when rsync is unavailable on the remote"""
-        remote_dest = f"{self.user}@{self.host}:{remote_path}"
-
-        cmd = ["scp", "-P", self.port, "-o", "StrictHostKeyChecking=no"]
-        if self.identity:
-            cmd.extend(["-i", self.identity])
-        if local_path.is_dir():
-            cmd.append("-r")
-        cmd.extend([str(local_path), remote_dest])
-
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            if progress_callback:
-                progress_callback(True, f"✅ {local_path.name} (scp fallback)")
-            return True
-        except subprocess.CalledProcessError as e:
-            if progress_callback:
-                progress_callback(False, f"❌ {local_path.name}: {e.stderr}")
-            return False
 
     def upload(self, local_path: str, remote_path: str, progress_callback=None) -> bool:
         """Upload file or folder to remote path"""
@@ -243,17 +278,30 @@ class FileUploader:
                 progress_callback(False, f"Not found: {local_path}")
             return False
 
-        remote_dest = f"{self.user}@{self.host}:{remote_path}"
+        remote_base = remote_path.rstrip("/")
+        remote_dest = f"{self.user}@{self.host}:{remote_base}"
 
         cmd = [
             "rsync",
-            "-avz",
-            "--progress",
+            "-av",
+            "--info=progress2",
+            "--skip-compress=png,jpg,jpeg,webp,gif,mp4,mkv,zip,7z",
             "-e",
             self._build_ssh_args(),
         ]
 
-        local_str = str(local_path)
+        if local_path.is_dir():
+            local_name = local_path.name
+            remote_name = Path(remote_base).name
+            if remote_name == local_name:
+                remote_parent = str(Path(remote_base).parent).rstrip("/")
+                local_str = str(local_path)
+                remote_dest = f"{self.user}@{self.host}:{remote_parent}/"
+            else:
+                local_str = f"{local_path}/"
+                remote_dest = f"{self.user}@{self.host}:{remote_base}/"
+        else:
+            local_str = str(local_path)
         cmd.extend([local_str, remote_dest])
 
         try:
@@ -269,35 +317,8 @@ class FileUploader:
 
         except subprocess.CalledProcessError as e:
             err = e.stderr or ""
-            if "rsync: command not found" in err or "rsync: not found" in err:
-                if progress_callback:
-                    progress_callback(
-                        None,
-                        f"Remote rsync missing; falling back to scp for {local_path.name}",
-                    )
-                return self._upload_via_scp(local_path, remote_path, progress_callback)
             if progress_callback:
                 progress_callback(False, f"❌ {local_path.name}: {err}")
-            return False
-
-    def _download_via_scp(
-        self, remote_path: str, local_dest: Path, progress_callback=None
-    ) -> bool:
-        """Fallback download using scp"""
-        cmd = ["scp", "-P", self.port, "-o", "StrictHostKeyChecking=no"]
-        if self.identity:
-            cmd.extend(["-i", self.identity])
-        # Always use -r; scp handles files fine
-        cmd.append("-r")
-        cmd.extend([f"{self.user}@{self.host}:{remote_path}", str(local_dest)])
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            if progress_callback:
-                progress_callback(True, f"✅ Downloaded {Path(remote_path).name} (scp)")
-            return True
-        except subprocess.CalledProcessError as e:
-            if progress_callback:
-                progress_callback(False, f"❌ Download failed: {e.stderr}")
             return False
 
     def download(
@@ -310,8 +331,9 @@ class FileUploader:
         source = f"{self.user}@{self.host}:{remote_path}"
         cmd = [
             "rsync",
-            "-avz",
-            "--progress",
+            "-av",
+            "--info=progress2",
+            "--skip-compress=png,jpg,jpeg,webp,gif,mp4,mkv,zip,7z",
             "-e",
             self._build_ssh_args(),
             source,
@@ -327,15 +349,6 @@ class FileUploader:
             return True
         except subprocess.CalledProcessError as e:
             err = e.stderr or ""
-            if "rsync: command not found" in err or "rsync: not found" in err:
-                if progress_callback:
-                    progress_callback(
-                        None,
-                        f"Remote rsync missing; falling back to scp for {Path(remote_path).name}",
-                    )
-                return self._download_via_scp(
-                    remote_path, local_dest_path, progress_callback
-                )
             if progress_callback:
                 progress_callback(False, f"❌ Download failed: {err}")
             return False
@@ -831,11 +844,12 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.path_edit = QtWidgets.QLineEdit(self.current_remote_path)
         self.path_edit.returnPressed.connect(self.navigate_to_path)
         path_bar.addWidget(self.path_edit)
-        go_btn = QtWidgets.QToolButton()
-        go_btn.setObjectName("ghost")
-        go_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ArrowForward))
-        go_btn.clicked.connect(self.navigate_to_path)
-        path_bar.addWidget(go_btn)
+        up_btn = QtWidgets.QToolButton()
+        up_btn.setObjectName("ghost")
+        up_btn.setText("^")
+        up_btn.setToolTip("Up one directory")
+        up_btn.clicked.connect(self.go_up_directory)
+        path_bar.addWidget(up_btn)
         refresh_btn = QtWidgets.QToolButton()
         refresh_btn.setObjectName("ghost")
         refresh_btn.setIcon(
@@ -1039,6 +1053,23 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.remote_fs = None
         self.uploader = None
 
+        if not shutil.which("hpnssh"):
+            self.set_status("HPN-SSH not found")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "HPN-SSH Missing",
+                "hpnssh not found on PATH.\n\nInstall HPN-SSH to use the uploader.",
+            )
+            return
+        if not shutil.which("rsync"):
+            self.set_status("rsync not found")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "rsync Missing",
+                "rsync not found on PATH.\n\nInstall rsync to use the uploader.",
+            )
+            return
+
         try:
             ssh_config = SSHConfig()
             self.host_info = ssh_config.get_host_info(host_alias)
@@ -1047,6 +1078,10 @@ class UploaderWindow(QtWidgets.QMainWindow):
             port = self.host_info.get("port", "22")
             user = self.host_info.get("user", "user")
             identity = self.host_info.get("identity", "")
+
+            mapped_port = _resolve_vast_port(hostname, 2222)
+            if mapped_port:
+                port = mapped_port
 
             self.remote_fs = RemoteFileSystem(hostname, port, user, identity)
             self.uploader = FileUploader(hostname, port, user, identity)
@@ -1157,6 +1192,11 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self.current_remote_path = new_path
             self.refresh_remote_view()
             self.sync_folder_selection(new_path)
+
+    def go_up_directory(self):
+        self.current_remote_path = str(Path(self.current_remote_path).parent)
+        self.refresh_remote_view()
+        self.sync_folder_selection(self.current_remote_path)
 
     def handle_drop(self, paths: List[str], target_path: str):
         if not self.uploader:

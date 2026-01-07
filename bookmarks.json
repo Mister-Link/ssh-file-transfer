@@ -1,6 +1,7 @@
 {
   "vast-ai": [
     "/home/user",
-    "/home/user/output"
+    "/home/user/output",
+    "/home/user/input"
   ]
 }
