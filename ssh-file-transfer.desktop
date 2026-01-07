@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SSH File Transfer
+Comment=Fast file uploader over SSH
+Icon=input-leap-transfering
+Exec=/usr/bin/env python3 /home/developer/Projects/ssh-file-transfer/upload_gui.py
+Path=/home/developer/Projects/ssh-file-transfer
+Terminal=false
+Categories=Utility;Network;
+Keywords=ssh;scp;upload;

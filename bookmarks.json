@@ -2,6 +2,7 @@
   "vast-ai": [
     "/home/user",
     "/home/user/output",
-    "/home/user/input"
+    "/home/user/input",
+    "/home/user/models"
   ]
 }
