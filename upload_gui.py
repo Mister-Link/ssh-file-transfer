@@ -4,13 +4,16 @@ Fast File Uploader (PySide6)
 Qt-based UI with drag-and-drop uploads and remote file browser.
 """
 
+import json
 import os
 import shlex
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -121,7 +124,11 @@ class RemoteFileSystem:
         """List files and directories at path"""
         if path in self.cache:
             return self.cache[path]
-        command = f'cd "{path}" 2>/dev/null && ls -lA --group-directories-first 2>/dev/null || echo "ERROR"'
+        command = (
+            'cd "{path}" 2>/dev/null && '
+            "TZ=UTC ls -lA --time-style=+%Y-%m-%dT%H:%M:%S "
+            '--group-directories-first 2>/dev/null || echo "ERROR"'
+        ).format(path=path)
         output = self._run_ssh_command(command)
 
         if output.strip() == "ERROR":
@@ -132,12 +139,13 @@ class RemoteFileSystem:
             if not line or line.startswith("total"):
                 continue
 
-            parts = line.split(None, 8)
-            if len(parts) < 9:
+            parts = line.split(None, 6)
+            if len(parts) < 7:
                 continue
 
             perms = parts[0]
-            raw_name = parts[8]
+            raw_name = parts[6]
+            mtime = parts[5]
 
             if raw_name in [".", ".."]:
                 continue
@@ -161,6 +169,7 @@ class RemoteFileSystem:
                     "link_target": link_target,
                     "perms": perms,
                     "size": parts[4],
+                    "mtime": mtime,
                 }
             )
 
@@ -207,8 +216,6 @@ class FileUploader:
     ) -> bool:
         """Fallback upload using scp when rsync is unavailable on the remote"""
         remote_dest = f"{self.user}@{self.host}:{remote_path}"
-        if not remote_path.endswith("/"):
-            remote_dest += "/"
 
         cmd = ["scp", "-P", self.port, "-o", "StrictHostKeyChecking=no"]
         if self.identity:
@@ -234,6 +241,43 @@ class FileUploader:
         if not local_path.exists():
             if progress_callback:
                 progress_callback(False, f"Not found: {local_path}")
+            return False
+
+        remote_dest = f"{self.user}@{self.host}:{remote_path}"
+
+        cmd = [
+            "rsync",
+            "-avz",
+            "--progress",
+            "-e",
+            self._build_ssh_args(),
+        ]
+
+        local_str = str(local_path)
+        cmd.extend([local_str, remote_dest])
+
+        try:
+            if progress_callback:
+                progress_callback(None, f"Uploading {local_path.name}...")
+
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+            if progress_callback:
+                progress_callback(True, f"✅ {local_path.name}")
+
+            return True
+
+        except subprocess.CalledProcessError as e:
+            err = e.stderr or ""
+            if "rsync: command not found" in err or "rsync: not found" in err:
+                if progress_callback:
+                    progress_callback(
+                        None,
+                        f"Remote rsync missing; falling back to scp for {local_path.name}",
+                    )
+                return self._upload_via_scp(local_path, remote_path, progress_callback)
+            if progress_callback:
+                progress_callback(False, f"❌ {local_path.name}: {err}")
             return False
 
     def _download_via_scp(
@@ -294,45 +338,6 @@ class FileUploader:
                 )
             if progress_callback:
                 progress_callback(False, f"❌ Download failed: {err}")
-            return False
-
-        remote_dest = f"{self.user}@{self.host}:{remote_path}"
-        if not remote_path.endswith("/"):
-            remote_dest += "/"
-
-        cmd = [
-            "rsync",
-            "-avz",
-            "--progress",
-            "-e",
-            self._build_ssh_args(),
-        ]
-
-        local_str = str(local_path)
-        cmd.extend([local_str, remote_dest])
-
-        try:
-            if progress_callback:
-                progress_callback(None, f"Uploading {local_path.name}...")
-
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-            if progress_callback:
-                progress_callback(True, f"✅ {local_path.name}")
-
-            return True
-
-        except subprocess.CalledProcessError as e:
-            err = e.stderr or ""
-            if "rsync: command not found" in err or "rsync: not found" in err:
-                if progress_callback:
-                    progress_callback(
-                        None,
-                        f"Remote rsync missing; falling back to scp for {local_path.name}",
-                    )
-                return self._upload_via_scp(local_path, remote_path, progress_callback)
-            if progress_callback:
-                progress_callback(False, f"❌ {local_path.name}: {err}")
             return False
 
 
@@ -407,9 +412,20 @@ def human_size(size_str: str) -> str:
     while size >= 1024 and idx < len(units) - 1:
         size /= 1024.0
         idx += 1
-    if size >= 10 or idx == 0:
-        return f"{int(size)} {units[idx]}"
-    return f"{size:.1f} {units[idx]}"
+    value = int(round(size))
+    return f"{value:>6} {units[idx]:>2}"
+
+
+def format_mtime(iso_str: str) -> str:
+    """Convert UTC timestamp to Mountain Time for display."""
+    try:
+        dt = datetime.strptime(iso_str, "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+        mt = dt.astimezone(ZoneInfo("America/Denver"))
+        return f"{mt.strftime('%B')} {mt.day}, {mt.hour:02d}:{mt.minute:02d}"
+    except Exception:
+        return iso_str
 
 
 TypeRole = QtCore.Qt.UserRole + 1
@@ -421,6 +437,7 @@ class RemoteTreeView(QtWidgets.QTreeView):
     renameRequested = QtCore.Signal(str, str)
     deleteRequested = QtCore.Signal(str)
     downloadRequested = QtCore.Signal(str, bool)
+    bookmarkRequested = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -446,7 +463,12 @@ class RemoteTreeView(QtWidgets.QTreeView):
 
     def dragMoveEvent(self, event: QtGui.QDragMoveEvent):
         if event.mimeData().hasUrls():
-            idx = self.indexAt(event.position().toPoint())
+            pos = (
+                event.position().toPoint()
+                if hasattr(event, "position")
+                else event.pos()
+            )
+            idx = self.indexAt(pos)
             if idx.isValid():
                 self.setCurrentIndex(idx)
             event.acceptProposedAction()
@@ -463,7 +485,8 @@ class RemoteTreeView(QtWidgets.QTreeView):
             if url.isLocalFile():
                 local_paths.append(url.toLocalFile())
 
-        idx = self.indexAt(event.position().toPoint())
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        idx = self.indexAt(pos)
         target_path = self.current_path
 
         if idx.isValid():
@@ -490,13 +513,18 @@ class RemoteTreeView(QtWidgets.QTreeView):
 
         menu = QtWidgets.QMenu(self)
         download_action = menu.addAction("Download")
+        bookmark_action = None
+        if item_type in ("folder", "link"):
+            bookmark_action = menu.addAction("Add bookmark")
         rename_action = menu.addAction("Rename")
         delete_action = menu.addAction("Delete")
-        action = menu.exec_(self.viewport().mapToGlobal(pos))
+        action = menu.exec(self.viewport().mapToGlobal(pos))
 
         full_path = str(Path(self.current_path) / name)
         if action == download_action:
             self.downloadRequested.emit(full_path, item_type in ("folder", "link"))
+        elif bookmark_action and action == bookmark_action:
+            self.bookmarkRequested.emit(full_path)
         elif action == rename_action:
             self.renameRequested.emit(full_path, name)
         elif action == delete_action:
@@ -509,6 +537,7 @@ class FolderTreeView(QtWidgets.QTreeView):
     renameRequested = QtCore.Signal(str, str)
     deleteRequested = QtCore.Signal(str)
     downloadRequested = QtCore.Signal(str, bool)
+    bookmarkRequested = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -533,7 +562,12 @@ class FolderTreeView(QtWidgets.QTreeView):
 
     def dragMoveEvent(self, event: QtGui.QDragMoveEvent):
         if event.mimeData().hasUrls():
-            idx = self.indexAt(event.position().toPoint())
+            pos = (
+                event.position().toPoint()
+                if hasattr(event, "position")
+                else event.pos()
+            )
+            idx = self.indexAt(pos)
             if idx.isValid():
                 self.setCurrentIndex(idx)
             event.acceptProposedAction()
@@ -548,7 +582,11 @@ class FolderTreeView(QtWidgets.QTreeView):
         for url in event.mimeData().urls():
             if url.isLocalFile():
                 local_paths.append(url.toLocalFile())
-        idx = self.indexAt(event.position().toPoint())
+        if not local_paths:
+            event.ignore()
+            return
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        idx = self.indexAt(pos)
         target_path = "/"
         if idx.isValid():
             target_path = idx.data(PathRole) or target_path
@@ -564,16 +602,128 @@ class FolderTreeView(QtWidgets.QTreeView):
             return
         menu = QtWidgets.QMenu(self)
         download_action = menu.addAction("Download")
+        bookmark_action = menu.addAction("Add bookmark")
         rename_action = menu.addAction("Rename")
         delete_action = menu.addAction("Delete")
-        action = menu.exec_(self.viewport().mapToGlobal(pos))
+        action = menu.exec(self.viewport().mapToGlobal(pos))
         name = Path(path).name or path
         if action == download_action:
             self.downloadRequested.emit(path, True)
+        elif action == bookmark_action:
+            self.bookmarkRequested.emit(path)
         elif action == rename_action:
             self.renameRequested.emit(path, name)
         elif action == delete_action:
             self.deleteRequested.emit(path)
+
+
+class BookmarkList(QtWidgets.QListWidget):
+    navigateRequested = QtCore.Signal(str)
+    dropRequested = QtCore.Signal(list, str)
+    removeRequested = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._suppress_nav = False
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.setUniformItemSizes(True)
+        self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.open_context_menu)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DropOnly)
+        self.setDefaultDropAction(QtCore.Qt.CopyAction)
+        self.itemClicked.connect(self.on_click)
+        self.itemDoubleClicked.connect(self.on_double_click)
+        self.setSpacing(2)
+        self.setStyleSheet(
+            """
+            QListWidget {
+                background: #0f1626;
+                border: 1px solid #1f2937;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QListWidget::item {
+                padding: 5px 8px;
+                margin: 1px 0;
+                border-radius: 6px;
+                color: #e6edf3;
+            }
+            QListWidget::item:hover {
+                background: #1b2434;
+            }
+            QListWidget::item:selected {
+                background: #2f4d63;
+                color: #e6edf3;
+            }
+            """
+        )
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent):
+        if event.mimeData().hasUrls():
+            pos = (
+                event.position().toPoint()
+                if hasattr(event, "position")
+                else event.pos()
+            )
+            if self.itemAt(pos):
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QtGui.QDropEvent):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        local_paths = []
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                local_paths.append(url.toLocalFile())
+        if not local_paths:
+            event.ignore()
+            return
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        item = self.itemAt(pos)
+        if item:
+            target_path = item.data(QtCore.Qt.UserRole)
+            event.setDropAction(QtCore.Qt.CopyAction)
+            self.dropRequested.emit(local_paths, target_path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+        # Suppress navigation triggered by mouse release after drop
+        self._suppress_nav = True
+        QtCore.QTimer.singleShot(200, lambda: setattr(self, "_suppress_nav", False))
+
+    def on_click(self, item: QtWidgets.QListWidgetItem):
+        if self._suppress_nav:
+            return
+        path = item.data(QtCore.Qt.UserRole)
+        if path:
+            self.navigateRequested.emit(path)
+
+    def on_double_click(self, item: QtWidgets.QListWidgetItem):
+        self.on_click(item)
+
+    def open_context_menu(self, pos: QtCore.QPoint):
+        item = self.itemAt(pos)
+        if not item:
+            return
+        menu = QtWidgets.QMenu(self)
+        remove_action = menu.addAction("Remove bookmark")
+        action = menu.exec(self.mapToGlobal(pos))
+        if action == remove_action:
+            path = item.data(QtCore.Qt.UserRole)
+            self.removeRequested.emit(path)
 
 
 class UploaderWindow(QtWidgets.QMainWindow):
@@ -589,11 +739,17 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.workers: List[QtCore.QThread] = []
         self._initializing_hosts = False
         self.folder_workers = {}
+        self._refresh_expand_flag = True
+        self.bookmarks_file = Path(__file__).parent / "bookmarks.json"
+        self.bookmarks = {}
 
         self._build_palette()
         self._setup_ui()
         QtCore.QTimer.singleShot(0, self.connect_to_host)
         self._populate_hosts()
+        app = QtWidgets.QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(self._stop_workers)
 
     def _build_palette(self):
         palette = QtGui.QPalette()
@@ -640,12 +796,27 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.folder_tree.setModel(self.folder_model)
         self.folder_tree.expanded.connect(self.on_folder_expanded)
         self.folder_tree.clicked.connect(self.on_folder_clicked)
+        self.folder_tree.collapsed.connect(self.on_folder_collapsed)
         self.folder_tree.dropRequested.connect(self.handle_drop)
         self.folder_tree.renameRequested.connect(self.handle_rename)
         self.folder_tree.deleteRequested.connect(self.handle_delete)
         self.folder_tree.downloadRequested.connect(self.handle_download)
+        self.folder_tree.bookmarkRequested.connect(self.add_bookmark)
         sidebar_layout.addWidget(self.folder_tree)
         sidebar_layout.setStretch(1, 1)
+
+        # Bookmarks
+        bookmarks_header = QtWidgets.QLabel("Bookmarks")
+        bookmarks_header.setObjectName("muted")
+        bookmarks_header.setStyleSheet(
+            "padding: 4px 6px; font-weight: 600; letter-spacing: 0.3px;"
+        )
+        sidebar_layout.addWidget(bookmarks_header)
+        self.bookmark_list = BookmarkList()
+        self.bookmark_list.navigateRequested.connect(self.navigate_to_bookmark)
+        self.bookmark_list.dropRequested.connect(self.handle_drop)
+        self.bookmark_list.removeRequested.connect(self.remove_bookmark)
+        sidebar_layout.addWidget(self.bookmark_list)
 
         splitter.addWidget(sidebar_widget)
         splitter.setStretchFactor(0, 0)
@@ -670,7 +841,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
         refresh_btn.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
         )
-        refresh_btn.clicked.connect(self.refresh_remote_view)
+        refresh_btn.clicked.connect(lambda: self.refresh_remote_view(force=True))
         path_bar.addWidget(refresh_btn)
 
         # Host dropdown to the right, aligned
@@ -686,20 +857,27 @@ class UploaderWindow(QtWidgets.QMainWindow):
         main_layout.addLayout(path_bar)
 
         self.model = QtGui.QStandardItemModel(0, 3)
-        self.model.setHorizontalHeaderLabels(["Name", "Type", "Size"])
+        self.model.setHorizontalHeaderLabels(["Name", "Modified", "Size"])
 
         self.tree = RemoteTreeView()
         self.tree.setModel(self.model)
         self.tree.setRootIsDecorated(False)
         self.tree.setSortingEnabled(True)
         self.tree.sortByColumn(0, QtCore.Qt.AscendingOrder)
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
         self.tree.doubleClicked.connect(self.on_tree_double_click)
         self.tree.dropRequested.connect(self.handle_drop)
         self.tree.renameRequested.connect(self.handle_rename)
         self.tree.deleteRequested.connect(self.handle_delete)
         self.tree.downloadRequested.connect(self.handle_download)
+        self.tree.bookmarkRequested.connect(self.add_bookmark)
         self.tree.setColumnWidth(0, 600)
-        self.tree.setColumnWidth(1, 140)
+        self.tree.setColumnWidth(1, 170)
+        self.tree.setColumnWidth(2, 110)
         main_layout.addWidget(self.tree)
 
         self.log_box = QtWidgets.QPlainTextEdit()
@@ -746,6 +924,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
             return
 
         worker = RemoteListWorker(self.remote_fs, path)
+        worker.setParent(self)
 
         def on_done(p, items, target_item=item):
             self.folder_workers.pop(p, None)
@@ -790,6 +969,28 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self.refresh_remote_view()
             self.path_edit.setText(path)
 
+    def on_folder_collapsed(self, index: QtCore.QModelIndex):
+        item = self.folder_model.itemFromIndex(index)
+        if not item:
+            return
+        path = item.data(PathRole)
+        current = Path(self.current_remote_path)
+        collapsed = Path(path)
+        # If current path is inside the collapsed folder, move up to the collapsed path
+        try:
+            current.relative_to(collapsed)
+            self.current_remote_path = str(collapsed)
+            self.refresh_remote_view(expand=False)
+            self.path_edit.setText(self.current_remote_path)
+            # Do not auto-expand again; just select the collapsed folder
+            idx = self.folder_model.indexFromItem(item)
+            if idx.isValid():
+                self.folder_tree.blockSignals(True)
+                self.folder_tree.setCurrentIndex(idx)
+                self.folder_tree.blockSignals(False)
+        except Exception:
+            pass
+
     def log(self, message: str):
         self.log_box.appendPlainText(message)
         self.log_box.verticalScrollBar().setValue(
@@ -823,6 +1024,8 @@ class UploaderWindow(QtWidgets.QMainWindow):
         else:
             self.host_combo.setCurrentIndex(0)
         self._initializing_hosts = False
+        self.load_bookmarks()
+        self.update_bookmark_list()
 
     def on_host_changed(self, text: str):
         if self._initializing_hosts:
@@ -850,8 +1053,9 @@ class UploaderWindow(QtWidgets.QMainWindow):
 
             self.set_status(f"Connected: {user}@{hostname}:{port}")
             self.log(f"Connected to {user}@{hostname}:{port}")
+            self.update_bookmark_list()
             self.build_folder_root(self.current_remote_path)
-            self.refresh_remote_view()
+            self.refresh_remote_view(force=True)
         except FileNotFoundError as e:
             self.set_status("SSH config not found")
             QtWidgets.QMessageBox.critical(
@@ -865,12 +1069,14 @@ class UploaderWindow(QtWidgets.QMainWindow):
                 f"Failed to connect to '{host_alias}':\n\n{e}\n\nCheck your ~/.ssh/config entry.",
             )
 
-    def refresh_remote_view(self):
+    def refresh_remote_view(self, expand: bool = True, force: bool = False):
         if not self.remote_fs:
             return
 
         path = self.current_remote_path
-        self.remote_fs.clear_cache(path)
+        if force:
+            self.remote_fs.clear_cache(path)
+        self._refresh_expand_flag = expand
         # keep status stable during refresh
         self.model.removeRows(0, self.model.rowCount())
         worker = RemoteListWorker(self.remote_fs, path)
@@ -896,11 +1102,12 @@ class UploaderWindow(QtWidgets.QMainWindow):
             parent_item = QtGui.QStandardItem(folder_icon, "..")
             parent_item.setData("parent", TypeRole)
             parent_item.setEditable(False)
-            type_item = QtGui.QStandardItem("parent")
+            modified_item = QtGui.QStandardItem("")
             size_item = QtGui.QStandardItem("")
-            for item in (type_item, size_item):
+            for item in (modified_item, size_item):
                 item.setEditable(False)
-            self.model.appendRow([parent_item, type_item, size_item])
+            size_item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            self.model.appendRow([parent_item, modified_item, size_item])
 
         for item in items:
             icon = folder_icon if item["is_dir"] else file_icon
@@ -914,15 +1121,16 @@ class UploaderWindow(QtWidgets.QMainWindow):
                 item_type = "link"
             name_item.setData(item_type, TypeRole)
             name_item.setEditable(False)
-            type_item = QtGui.QStandardItem(item_type)
-            type_item.setEditable(False)
+            modified_item = QtGui.QStandardItem(format_mtime(item.get("mtime", "")))
+            modified_item.setEditable(False)
             size_item = QtGui.QStandardItem(human_size(item.get("size", "")))
             size_item.setEditable(False)
-            self.model.appendRow([name_item, type_item, size_item])
+            size_item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            self.model.appendRow([name_item, modified_item, size_item])
 
         self.set_status("")
         self.log(f"Loaded {len(items)} items from {path}")
-        self.sync_folder_selection(path)
+        self.sync_folder_selection(path, expand=self._refresh_expand_flag)
 
     def on_remote_load_failed(self, error: str):
         self.set_status("Failed to load directory")
@@ -956,21 +1164,71 @@ class UploaderWindow(QtWidgets.QMainWindow):
                 self, "Not connected", "Connect to a host first."
             )
             return
-        if not paths:
+        if not paths or not target_path:
             return
+        refresh_after = target_path == self.current_remote_path
+        entries_by_name = {}
         if self.remote_fs:
-            self.remote_fs.clear_cache(target_path)
+            self.remote_fs.clear_cache(target_path if refresh_after else None)
+            try:
+                entries = self.remote_fs.list_directory(target_path)
+                entries_by_name = {e.get("name"): e for e in entries if e.get("name")}
+            except Exception:
+                entries_by_name = {}
 
         last_idx = len(paths) - 1
         for i, local_path in enumerate(paths):
-            worker = UploadWorker(self.uploader, local_path, target_path)
+            local_name = Path(local_path).name
+            target_name = local_name
+            existing = entries_by_name.get(target_name)
+            overwrite = False
+
+            while existing:
+                current_name = target_name
+                text, ok = QtWidgets.QInputDialog.getText(
+                    self,
+                    "Name conflict",
+                    f"'{target_name}' exists in {target_path}.\n"
+                    "Enter a new name or keep it to overwrite:",
+                    text=target_name,
+                )
+                if not ok:
+                    target_name = None
+                    break
+                text = text.strip()
+                if not text:
+                    continue
+                if text == current_name:
+                    overwrite = True
+                    target_name = text
+                    break
+                target_name = text
+                existing = entries_by_name.get(target_name)
+                if not existing:
+                    break
+
+            if not target_name:
+                continue
+
+            if overwrite and existing and self.remote_fs:
+                try:
+                    self.remote_fs.delete_path(str(Path(target_path) / target_name))
+                    entries_by_name.pop(target_name, None)
+                except Exception:
+                    pass
+
+            remote_dest = str(Path(target_path) / target_name)
+            entries_by_name[target_name] = {"name": target_name}
+            worker = UploadWorker(self.uploader, local_path, remote_dest)
             worker.progress.connect(self.log)
-            if i == last_idx:
-                worker.finished.connect(lambda success: self.refresh_remote_view())
+            if refresh_after and i == last_idx:
+                worker.finished.connect(
+                    lambda success: self.refresh_remote_view(force=True)
+                )
             self._register_worker(worker)
             worker.start()
 
-    def sync_folder_selection(self, path: str):
+    def sync_folder_selection(self, path: str, expand: bool = True):
         """Select/expand folder tree to the current path"""
         target = Path(path)
         # build chain of parts
@@ -991,11 +1249,13 @@ class UploaderWindow(QtWidgets.QMainWindow):
             current_path = current_path / seg
             if item is None:
                 break
-            self.ensure_folder_children(item)
+            if expand:
+                self.ensure_folder_children(item)
             next_item = find_child(item, seg)
             if next_item:
                 idx = self.folder_model.indexFromItem(next_item)
-                self.folder_tree.setExpanded(idx, True)
+                if expand:
+                    self.folder_tree.setExpanded(idx, True)
                 item = next_item
             else:
                 break
@@ -1022,7 +1282,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self.log(f"Renamed {current_name} -> {new_name}")
             if self.remote_fs:
                 self.remote_fs.clear_cache(str(Path(full_path).parent))
-            self.refresh_remote_view()
+            self.refresh_remote_view(force=True)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Rename failed", str(e))
 
@@ -1047,7 +1307,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self.log(f"Deleted {target_name}")
             if self.remote_fs:
                 self.remote_fs.clear_cache(str(Path(full_path).parent))
-            self.refresh_remote_view()
+            self.refresh_remote_view(force=True)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Delete failed", str(e))
 
@@ -1058,13 +1318,19 @@ class UploaderWindow(QtWidgets.QMainWindow):
             )
             return
 
+        default_dir = str(Path.home() / "Downloads")
         target_dir = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Select download destination"
+            self, "Select download destination", default_dir
         )
         if not target_dir:
             return
         remote_name = Path(remote_path).name or "download"
-        local_dest = str(Path(target_dir) / remote_name)
+        dest_path = Path(target_dir) / remote_name
+        counter = 1
+        while dest_path.exists():
+            dest_path = Path(target_dir) / f"{remote_name}_{counter}"
+            counter += 1
+        local_dest = str(dest_path)
 
         if self.remote_fs:
             parent = str(Path(remote_path).parent)
@@ -1077,6 +1343,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
 
     def _register_worker(self, worker: QtCore.QThread):
         """Track and clean up workers safely"""
+        worker.setParent(self)
         self.workers.append(worker)
         worker.finished.connect(lambda: self._cleanup_worker(worker))
         worker.finished.connect(worker.deleteLater)
@@ -1089,6 +1356,99 @@ class UploaderWindow(QtWidgets.QMainWindow):
         if worker in self.workers:
             self.workers.remove(worker)
 
+    def _stop_workers(self):
+        # Best-effort shutdown of running workers
+        for w in list(self.folder_workers.values()):
+            try:
+                w.requestInterruption()
+                w.wait(500)
+            except Exception:
+                pass
+        self.folder_workers.clear()
+        for w in list(self.workers):
+            try:
+                w.requestInterruption()
+                w.wait(500)
+            except Exception:
+                pass
+        self.workers.clear()
+
+    # Bookmarks
+    def load_bookmarks(self):
+        try:
+            if self.bookmarks_file.exists():
+                with open(self.bookmarks_file, "r") as f:
+                    self.bookmarks = json.load(f)
+            else:
+                self.bookmarks = {}
+        except Exception:
+            self.bookmarks = {}
+
+    def save_bookmarks(self):
+        try:
+            with open(self.bookmarks_file, "w") as f:
+                json.dump(self.bookmarks, f, indent=2)
+        except Exception:
+            pass
+
+    def current_host_key(self) -> str:
+        return self.host_combo.currentText() or "vast-ai"
+
+    def update_bookmark_list(self):
+        host = self.current_host_key()
+        entries = self.bookmarks.get(host, [])
+        self.bookmark_list.clear()
+        for p in entries:
+            item = QtWidgets.QListWidgetItem(p)
+            item.setData(QtCore.Qt.UserRole, p)
+            self.bookmark_list.addItem(item)
+
+    def add_bookmark(self, path: str):
+        if not self.remote_fs:
+            QtWidgets.QMessageBox.warning(
+                self, "Not connected", "Connect to a host first."
+            )
+            return
+        path = str(Path(path))
+        if path != "/":
+            parent = str(Path(path).parent)
+            name = Path(path).name
+            try:
+                entries = self.remote_fs.list_directory(parent)
+            except Exception:
+                entries = []
+            matched = next((e for e in entries if e.get("name") == name), None)
+            if not matched or not (matched.get("is_dir") or matched.get("is_link")):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Unsupported bookmark",
+                    "Only folders and symbolic links can be bookmarked.",
+                )
+                return
+        host = self.current_host_key()
+        entries = self.bookmarks.get(host, [])
+        if path not in entries:
+            entries.append(path)
+            self.bookmarks[host] = entries
+            self.save_bookmarks()
+            self.update_bookmark_list()
+
+    def remove_bookmark(self, path: str):
+        host = self.current_host_key()
+        entries = self.bookmarks.get(host, [])
+        if path in entries:
+            entries.remove(path)
+            self.bookmarks[host] = entries
+            self.save_bookmarks()
+            self.update_bookmark_list()
+
+    def navigate_to_bookmark(self, path: str):
+        if path:
+            self.current_remote_path = path
+            self.path_edit.setText(path)
+            self.refresh_remote_view(force=True)
+            self.sync_folder_selection(path)
+
 
 def main():
     try:
@@ -1100,7 +1460,9 @@ def main():
 
     window = UploaderWindow()
     window.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    window._stop_workers()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
