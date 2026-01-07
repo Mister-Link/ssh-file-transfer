@@ -1,0 +1,10 @@
+# For CLI uploader (upload.py):
+# No Python dependencies required - uses only stdlib
+
+# For GUI uploader (upload_gui.py):
+# Requires Qt runtime (PySide6 wheels include Qt)
+PySide6>=6.6.0
+
+# System requirements:
+# - rsync (install with: sudo pacman -S rsync)
+# - ssh (should be pre-installed)
