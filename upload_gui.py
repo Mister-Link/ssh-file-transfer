@@ -161,6 +161,143 @@ class RemoteFileSystem:
         cmd = f"rm -rf {shlex.quote(target_path)}"
         self._run_ssh_command(cmd)
 
+    def path_exists(self, target_path: str) -> bool:
+        """Check if a path exists on the remote server"""
+        cmd = f"test -e {shlex.quote(target_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
+        try:
+            result = self._run_ssh_command(cmd)
+            return result.strip() == "EXISTS"
+        except Exception:
+            return False
+
+
+class ConflictResolutionDialog(QtWidgets.QDialog):
+    """Dialog for resolving upload conflicts"""
+
+    def __init__(
+        self, parent: QtWidgets.QWidget | None, original_name: str, is_overwrite: bool
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Upload Conflict")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background: #0d1017;
+            }
+            QLabel {
+                color: #e6edf3;
+                font-size: 10pt;
+            }
+            QLabel#warning {
+                background: rgba(255, 152, 0, 0.12);
+                border-left: 3px solid #ff9800;
+                border-radius: 6px;
+                padding: 14px 16px;
+                color: #ffb74d;
+                font-size: 10pt;
+            }
+            QLabel#info {
+                color: #9fb3c8;
+                font-size: 9pt;
+                padding: 8px 4px;
+                line-height: 1.5;
+            }
+            QLineEdit {
+                background: #0f1626;
+                border: 1px solid #1f2937;
+                border-radius: 6px;
+                padding: 10px 12px;
+                color: #e6edf3;
+                font-size: 10pt;
+                selection-background-color: #1b2434;
+            }
+            QLineEdit:focus {
+                border: 1px solid #23c4b8;
+            }
+            QPushButton {
+                border-radius: 6px;
+                padding: 10px 20px;
+                font-weight: 600;
+                font-size: 10pt;
+                min-width: 90px;
+            }
+            QPushButton#accent {
+                background: #23c4b8;
+                color: #0b111b;
+                border: 0;
+            }
+            QPushButton#accent:hover {
+                background: #2dd4c7;
+            }
+            QPushButton#ghost {
+                background: #0f1626;
+                color: #e6edf3;
+                border: 1px solid #1f2937;
+            }
+            QPushButton#ghost:hover {
+                background: #1b2434;
+                border: 1px solid #2f4d63;
+            }
+            """
+        )
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Warning message
+        warning_label = QtWidgets.QLabel()
+        item_type = "folder" if is_overwrite else "file"
+        warning_text = (
+            f"<b>⚠ Upload Conflict</b><br/>"
+            f"<span style='font-weight: normal;'>The {item_type} "
+            f"<b style='color: #e6edf3;'>{original_name}</b> already exists at this location.</span>"
+        )
+        warning_label.setText(warning_text)
+        warning_label.setObjectName("warning")
+        warning_label.setWordWrap(True)
+        layout.addWidget(warning_label)
+
+        self.name_input = QtWidgets.QLineEdit(original_name)
+        self.name_input.setPlaceholderText("Enter new name or keep to overwrite")
+        self.name_input.selectAll()
+        layout.addWidget(self.name_input)
+
+        # Info label
+        info_label = QtWidgets.QLabel(
+            "• Keep the name <b>unchanged</b> to overwrite the existing item<br/>"
+            "• Change the name to upload as a different item"
+        )
+        info_label.setObjectName("info")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Spacer
+        layout.addSpacing(8)
+
+        # Buttons
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addStretch()
+
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.setObjectName("ghost")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+
+        confirm_btn = QtWidgets.QPushButton("Confirm")
+        confirm_btn.setObjectName("accent")
+        confirm_btn.clicked.connect(self.accept)
+        confirm_btn.setDefault(True)
+        button_layout.addWidget(confirm_btn)
+
+        layout.addLayout(button_layout)
+
+    def get_name(self) -> str:
+        """Get the name from the input field"""
+        return self.name_input.text().strip()
+
 
 class FileUploader:
     """Handle file uploads using rsync"""
@@ -195,8 +332,17 @@ class FileUploader:
         local_path: str,
         remote_path: str,
         progress_callback: Callable[[bool | None, str], None] | None = None,
+        custom_name: str | None = None,
+        delete_extra: bool = False,
     ) -> bool:
-        """Upload file or folder to remote path"""
+        """Upload file or folder to remote path
+
+        Args:
+            local_path: Local file or folder path
+            remote_path: Remote destination directory
+            progress_callback: Optional callback for progress updates
+            custom_name: Optional custom name for the uploaded item (for renaming during upload)
+        """
         local_path_obj = Path(local_path)
 
         if not local_path_obj.exists():
@@ -205,7 +351,17 @@ class FileUploader:
             return False
 
         remote_base = remote_path.rstrip("/")
-        remote_dest = f"{self.user}@{self.host}:{remote_base}"
+        display_name = custom_name or local_path_obj.name
+        item_type = "folder" if local_path_obj.is_dir() else "file"
+
+        # Calculate destination path for logging
+        dest_path = f"{remote_base}/{display_name}"
+
+        # If custom_name is provided, upload directly to that path
+        if custom_name:
+            remote_dest = f"{self.user}@{self.host}:{remote_base}/{custom_name}"
+        else:
+            remote_dest = f"{self.user}@{self.host}:{remote_base}"
 
         cmd = [
             "rsync",
@@ -216,30 +372,35 @@ class FileUploader:
             self._build_ssh_args(),
         ]
 
+        # Add --delete flag for overwrites to remove extra files on remote
+        if delete_extra:
+            cmd.append("--delete")
+
         if local_path_obj.is_dir():
             # Upload the folder itself (not just its contents) to the destination
             # No trailing slash on source = copy the folder itself
             local_str = str(local_path_obj)
-            remote_dest = f"{self.user}@{self.host}:{remote_base}/"
+            if not custom_name:
+                remote_dest = f"{self.user}@{self.host}:{remote_base}/"
         else:
             local_str = str(local_path_obj)
         cmd.extend([local_str, remote_dest])
 
         try:
             if progress_callback:
-                progress_callback(None, f"Uploading {local_path_obj.name}...")
+                progress_callback(None, f"Uploading {item_type} '{display_name}' to {remote_base}/")
 
-            _ = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
             if progress_callback:
-                progress_callback(True, f"✅ {local_path_obj.name}")
+                progress_callback(True, f"✅ {item_type.capitalize()} '{display_name}' written to {dest_path}")
 
             return True
 
         except subprocess.CalledProcessError as e:
-            err = e.stderr or ""
+            err = e.stderr or str(e)
             if progress_callback:
-                progress_callback(False, f"❌ {local_path_obj.name}: {err}")
+                progress_callback(False, f"❌ Failed to upload {item_type} '{display_name}': {err}")
             return False
 
     def download(
@@ -287,12 +448,23 @@ class UploadWorker(QtCore.QThread):
     uploader: FileUploader
     local_path: str
     remote_path: str
+    custom_name: str | None
+    delete_extra: bool
 
-    def __init__(self, uploader: FileUploader, local_path: str, remote_path: str):
+    def __init__(
+        self,
+        uploader: FileUploader,
+        local_path: str,
+        remote_path: str,
+        custom_name: str | None = None,
+        delete_extra: bool = False,
+    ):
         super().__init__()
         self.uploader = uploader
         self.local_path = local_path
         self.remote_path = remote_path
+        self.custom_name = custom_name
+        self.delete_extra = delete_extra
 
     @override
     def run(self) -> None:
@@ -300,7 +472,9 @@ class UploadWorker(QtCore.QThread):
             if message:
                 self.progress.emit(message)
 
-        success = self.uploader.upload(self.local_path, self.remote_path, cb)
+        success = self.uploader.upload(
+            self.local_path, self.remote_path, cb, self.custom_name, self.delete_extra
+        )
         self.finished_.emit(success)
 
 
@@ -980,12 +1154,51 @@ class UploaderWindow(QtWidgets.QMainWindow):
 
     def handle_drop(self, local_paths: list[str], remote_path: str) -> None:
         """Handle drag and drop operation"""
-        if not self.uploader:
+        if not self.uploader or not self.remote_fs:
             return
 
         for path in local_paths:
-            worker = UploadWorker(self.uploader, path, remote_path)
-            worker.progress.connect(self.log_box.appendPlainText)
+            local_path_obj = Path(path)
+            original_name = local_path_obj.name
+            target_path = str(Path(remote_path) / original_name)
+            item_type = "folder" if local_path_obj.is_dir() else "file"
+
+            # Check if the target already exists
+            if self.remote_fs.path_exists(target_path):
+                # Show conflict resolution dialog
+                is_dir = local_path_obj.is_dir()
+                dialog = ConflictResolutionDialog(self, original_name, is_dir)
+                result = dialog.exec()
+
+                if result != QtWidgets.QDialog.DialogCode.Accepted:
+                    # User cancelled
+                    self.log_box.appendPlainText(f"⏭ Skipped: {original_name}")
+                    continue
+
+                new_name = dialog.get_name()
+
+                if not new_name:
+                    # Empty name, skip
+                    self.log_box.appendPlainText(f"⏭ Skipped: {original_name} (empty name)")
+                    continue
+
+                # If name changed, use custom_name; if same, overwrite (no custom_name)
+                custom_name = new_name if new_name != original_name else None
+
+                if custom_name:
+                    self.log_box.appendPlainText(
+                        f"📝 Renaming {original_name} → {custom_name} during upload"
+                    )
+                    worker = UploadWorker(self.uploader, path, remote_path, custom_name, False)
+                else:
+                    # Overwrite: use rsync --delete to sync and remove extra files
+                    self.log_box.appendPlainText(f"♻️ Syncing {item_type} '{original_name}' (rsync will update and remove extra files)")
+                    worker = UploadWorker(self.uploader, path, remote_path, None, True)
+            else:
+                # No conflict, upload normally
+                worker = UploadWorker(self.uploader, path, remote_path, None, False)
+
+            worker.progress.connect(self._log_upload_progress)
             worker.finished_.connect(
                 lambda success, target=remote_path: self._on_upload_complete(
                     success, target
@@ -993,6 +1206,11 @@ class UploaderWindow(QtWidgets.QMainWindow):
             )
             self.workers.append(worker)
             worker.start()
+
+    def _log_upload_progress(self, message: str) -> None:
+        """Filter and format upload progress messages"""
+        # Log all messages from the upload process
+        self.log_box.appendPlainText(message)
 
     def _on_upload_complete(self, success: bool, target_path: str) -> None:
         """Handle upload completion - refresh views if they're showing the upload destination"""
