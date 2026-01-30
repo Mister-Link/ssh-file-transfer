@@ -43,16 +43,51 @@ class RemoteFileSystem:
     identity: str
     control_path: str
     cache: dict[str, list[FileSystemItem]]
+    proxycommand: str | None
 
-    def __init__(self, host: str, port: str, user: str, identity: str):
+    def __init__(
+        self,
+        host: str,
+        port: str,
+        user: str,
+        identity: str,
+        proxycommand: str | None = None,
+    ):
         self.host = host
         self.port = port
         self.user = user
         self.identity = identity
+        self.proxycommand = proxycommand
         self.control_path = str(
             Path(tempfile.gettempdir()) / f"uploader-ssh-{os.getpid()}"
         )
         self.cache = {}
+
+    def _reset_ssh_control(self) -> None:
+        """Reset the SSH control master connection"""
+        if os.path.exists(self.control_path):
+            try:
+                ssh_bin = shutil.which("hpnssh")
+                if ssh_bin:
+                    subprocess.run(
+                        [
+                            ssh_bin,
+                            "-O",
+                            "exit",
+                            "-o",
+                            f"ControlPath={self.control_path}",
+                            f"{self.user}@{self.host}",
+                        ],
+                        capture_output=True,
+                        timeout=5,
+                    )
+            except:
+                pass
+            # Remove the socket file
+            try:
+                os.unlink(self.control_path)
+            except:
+                pass
 
     def _run_ssh_command(self, command: str) -> str:
         """Execute command on remote host"""
@@ -75,12 +110,22 @@ class RemoteFileSystem:
             "ControlPersist=60",
         ]
 
+        if self.proxycommand:
+            ssh_cmd.extend(["-o", f"ProxyCommand={self.proxycommand}"])
+
         if self.identity:
             ssh_cmd.extend(["-i", self.identity])
 
         ssh_cmd.extend([f"{self.user}@{self.host}", command])
 
         try:
+            result = subprocess.run(
+                ssh_cmd, capture_output=True, text=True, check=True, timeout=10
+            )
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            # Control socket might be stuck, reset it and retry once
+            self._reset_ssh_control()
             result = subprocess.run(
                 ssh_cmd, capture_output=True, text=True, check=True, timeout=10
             )
@@ -163,7 +208,9 @@ class RemoteFileSystem:
 
     def path_exists(self, target_path: str) -> bool:
         """Check if a path exists on the remote server"""
-        cmd = f"test -e {shlex.quote(target_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
+        cmd = (
+            f"test -e {shlex.quote(target_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
+        )
         try:
             result = self._run_ssh_command(cmd)
             return result.strip() == "EXISTS"
@@ -306,12 +353,21 @@ class FileUploader:
     port: str
     user: str
     identity: str
+    proxycommand: str | None
 
-    def __init__(self, host: str, port: str, user: str, identity: str):
+    def __init__(
+        self,
+        host: str,
+        port: str,
+        user: str,
+        identity: str,
+        proxycommand: str | None = None,
+    ):
         self.host = host
         self.port = port
         self.user = user
         self.identity = identity
+        self.proxycommand = proxycommand
 
     def _build_ssh_args(self) -> str:
         """Build SSH arguments for rsync"""
@@ -325,6 +381,8 @@ class FileUploader:
             " -o StrictHostKeyChecking=no -o BatchMode=yes"
             " -o Compression=no -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"
         )
+        if self.proxycommand:
+            ssh_args += f" -o 'ProxyCommand={self.proxycommand}'"
         return ssh_args
 
     def upload(
@@ -388,19 +446,26 @@ class FileUploader:
 
         try:
             if progress_callback:
-                progress_callback(None, f"Uploading {item_type} '{display_name}' to {remote_base}/")
+                progress_callback(
+                    None, f"Uploading {item_type} '{display_name}' to {remote_base}/"
+                )
 
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
             if progress_callback:
-                progress_callback(True, f"✅ {item_type.capitalize()} '{display_name}' written to {dest_path}")
+                progress_callback(
+                    True,
+                    f"✅ {item_type.capitalize()} '{display_name}' written to {dest_path}",
+                )
 
             return True
 
         except subprocess.CalledProcessError as e:
             err = e.stderr or str(e)
             if progress_callback:
-                progress_callback(False, f"❌ Failed to upload {item_type} '{display_name}': {err}")
+                progress_callback(
+                    False, f"❌ Failed to upload {item_type} '{display_name}': {err}"
+                )
             return False
 
     def download(
@@ -945,12 +1010,14 @@ class UploaderWindow(QtWidgets.QMainWindow):
                 port=self.host_info["port"],
                 user=self.host_info["user"],
                 identity=self.host_info["identity"],
+                proxycommand=self.host_info.get("proxycommand"),
             )
             self.uploader = FileUploader(
                 host=self.host_info["hostname"],
                 port=self.host_info["port"],
                 user=self.host_info["user"],
                 identity=self.host_info["identity"],
+                proxycommand=self.host_info.get("proxycommand"),
             )
             self.log_box.appendPlainText(f"Connected to {host}")
             self._initialize_folder_view()
@@ -1179,7 +1246,9 @@ class UploaderWindow(QtWidgets.QMainWindow):
 
                 if not new_name:
                     # Empty name, skip
-                    self.log_box.appendPlainText(f"⏭ Skipped: {original_name} (empty name)")
+                    self.log_box.appendPlainText(
+                        f"⏭ Skipped: {original_name} (empty name)"
+                    )
                     continue
 
                 # If name changed, use custom_name; if same, overwrite (no custom_name)
@@ -1189,10 +1258,14 @@ class UploaderWindow(QtWidgets.QMainWindow):
                     self.log_box.appendPlainText(
                         f"📝 Renaming {original_name} → {custom_name} during upload"
                     )
-                    worker = UploadWorker(self.uploader, path, remote_path, custom_name, False)
+                    worker = UploadWorker(
+                        self.uploader, path, remote_path, custom_name, False
+                    )
                 else:
                     # Overwrite: use rsync --delete to sync and remove extra files
-                    self.log_box.appendPlainText(f"♻️ Syncing {item_type} '{original_name}' (rsync will update and remove extra files)")
+                    self.log_box.appendPlainText(
+                        f"♻️ Syncing {item_type} '{original_name}' (rsync will update and remove extra files)"
+                    )
                     worker = UploadWorker(self.uploader, path, remote_path, None, True)
             else:
                 # No conflict, upload normally

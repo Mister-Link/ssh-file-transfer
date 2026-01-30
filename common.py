@@ -45,7 +45,7 @@ class SSHConfig:
 
                 if line.startswith("Host "):
                     if current_host == host and host_config:
-                        return host_config
+                        return self._resolve_proxy_jump(host_config)
                     current_host = line.split()[1]
                     host_config = {}
 
@@ -59,11 +59,41 @@ class SSHConfig:
                     elif line.startswith("IdentityFile "):
                         identity = line.split()[1]
                         host_config["identity"] = str(Path(identity).expanduser())
+                    elif line.startswith("ProxyJump "):
+                        host_config["proxyjump"] = line.split()[1]
+                    elif line.startswith("ProxyCommand "):
+                        # Extract full ProxyCommand (can have multiple words)
+                        host_config["proxycommand"] = line[
+                            len("ProxyCommand ") :
+                        ].strip()
 
         if current_host == host and host_config:
-            return host_config
+            return self._resolve_proxy_jump(host_config)
 
         raise ValueError(f"Host '{host}' not found in SSH config")
+
+    def _resolve_proxy_jump(self, host_config: dict[str, str]) -> dict[str, str]:
+        """Resolve ProxyJump to ProxyCommand if present"""
+        if "proxyjump" in host_config and "proxycommand" not in host_config:
+            # Get jump host info
+            jump_host = host_config["proxyjump"]
+            jump_info = self.get_host_info(jump_host)
+
+            # Build ProxyCommand from jump host
+            ssh_cmd = "ssh"
+            if "port" in jump_info:
+                ssh_cmd += f" -p {jump_info['port']}"
+            if "identity" in jump_info:
+                ssh_cmd += f" -i {jump_info['identity']}"
+            if "user" in jump_info and "hostname" in jump_info:
+                ssh_cmd += f" {jump_info['user']}@{jump_info['hostname']}"
+            elif "hostname" in jump_info:
+                ssh_cmd += f" {jump_info['hostname']}"
+
+            ssh_cmd += " -W %h:%p"
+            host_config["proxycommand"] = ssh_cmd
+
+        return host_config
 
     def list_hosts(self) -> list[str]:
         """List host aliases from SSH config"""

@@ -1,8 +1,8 @@
 {
   "vast-ai": [
-    "/home/user",
-    "/home/user/output",
-    "/home/user/input",
-    "/home/user/models"
+    "/home/comfy",
+    "/home/comfy/output",
+    "/home/comfy/input",
+    "/home/comfy/models"
   ]
 }
