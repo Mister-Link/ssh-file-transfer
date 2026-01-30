@@ -1035,7 +1035,12 @@ class UploaderWindow(QtWidgets.QMainWindow):
             hosts = ssh_config.list_hosts()
             self.host_combo.addItems(hosts)
             if hosts:
-                self.host_combo.setCurrentIndex(0)
+                # Try to select vast-ai by default, otherwise use first host
+                try:
+                    vast_index = hosts.index("vast-ai")
+                    self.host_combo.setCurrentIndex(vast_index)
+                except ValueError:
+                    self.host_combo.setCurrentIndex(0)
                 self.connect_to_host()
         except Exception as e:
             self.log_box.appendPlainText(f"Error loading hosts: {e}")

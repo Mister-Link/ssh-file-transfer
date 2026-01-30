@@ -68,12 +68,19 @@ class SSHConfig:
                         ].strip()
 
         if current_host == host and host_config:
+            # Set default port to 22 if not specified
+            if "port" not in host_config:
+                host_config["port"] = "22"
             return self._resolve_proxy_jump(host_config)
 
         raise ValueError(f"Host '{host}' not found in SSH config")
 
     def _resolve_proxy_jump(self, host_config: dict[str, str]) -> dict[str, str]:
         """Resolve ProxyJump to ProxyCommand if present"""
+        # Ensure port is set (default to 22)
+        if "port" not in host_config:
+            host_config["port"] = "22"
+
         if "proxyjump" in host_config and "proxycommand" not in host_config:
             # Get jump host info
             jump_host = host_config["proxyjump"]
