@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Common functions for SSH and Vast.ai integration.
+Common functions for SSH, Vast.ai, and S3 integration.
 """
 
 from __future__ import annotations
@@ -9,6 +9,35 @@ import json
 import subprocess
 from pathlib import Path
 from typing import TypedDict, cast
+
+
+class S3HostConfig(TypedDict, total=False):
+    profile: str
+    bucket: str
+    prefix: str  # optional key prefix, e.g. "uploads/"
+    endpoint_url: str  # optional, e.g. "https://s3.us-west-1.wasabisys.com"
+
+
+def load_s3_hosts() -> dict[str, S3HostConfig]:
+    """Load S3 host definitions from s3_hosts.json next to this file."""
+    config_path = Path(__file__).parent / "s3_hosts.json"
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def get_s3_host_names() -> list[str]:
+    """Return the list of S3 host alias names."""
+    return list(load_s3_hosts().keys())
+
+
+def get_s3_host_config(name: str) -> S3HostConfig | None:
+    """Return the S3HostConfig for a given host alias, or None."""
+    return load_s3_hosts().get(name)
 
 
 class VastPort(TypedDict):
@@ -45,6 +74,8 @@ class SSHConfig:
 
                 if line.startswith("Host "):
                     if current_host == host and host_config:
+                        if "hostname" not in host_config:
+                            host_config["hostname"] = host
                         return self._resolve_proxy_jump(host_config)
                     current_host = line.split()[1]
                     host_config = {}
@@ -68,9 +99,10 @@ class SSHConfig:
                         ].strip()
 
         if current_host == host and host_config:
-            # Set default port to 22 if not specified
             if "port" not in host_config:
                 host_config["port"] = "22"
+            if "hostname" not in host_config:
+                host_config["hostname"] = host
             return self._resolve_proxy_jump(host_config)
 
         raise ValueError(f"Host '{host}' not found in SSH config")

@@ -17,10 +17,13 @@ from pathlib import Path
 from typing import Callable, TypedDict
 from zoneinfo import ZoneInfo
 
+import boto3
+import boto3.s3.transfer
+import botocore.exceptions
 from PySide6 import QtCore, QtGui, QtWidgets
 from typing_extensions import override
 
-from common import SSHConfig
+from common import SSHConfig, get_s3_host_config, get_s3_host_names
 
 
 class FileSystemItem(TypedDict):
@@ -34,6 +37,18 @@ class FileSystemItem(TypedDict):
     mtime: str
 
 
+class HostKeyMismatch(RuntimeError):
+    host: str
+    port: str
+    stderr: str
+
+    def __init__(self, host: str, port: str, stderr: str) -> None:
+        super().__init__(stderr)
+        self.host = host
+        self.port = port
+        self.stderr = stderr
+
+
 class RemoteFileSystem:
     """Handle remote filesystem operations via SSH"""
 
@@ -44,6 +59,7 @@ class RemoteFileSystem:
     control_path: str
     cache: dict[str, list[FileSystemItem]]
     proxycommand: str | None
+    command_timeout: int
 
     def __init__(
         self,
@@ -52,12 +68,14 @@ class RemoteFileSystem:
         user: str,
         identity: str,
         proxycommand: str | None = None,
+        command_timeout: int = 10,
     ):
         self.host = host
         self.port = port
         self.user = user
         self.identity = identity
-        self.proxycommand = proxycommand
+        self.proxycommand = self._normalize_proxycommand(proxycommand)
+        self.command_timeout = command_timeout
         self.control_path = str(
             Path(tempfile.gettempdir()) / f"uploader-ssh-{os.getpid()}"
         )
@@ -103,6 +121,12 @@ class RemoteFileSystem:
             "-o",
             "BatchMode=yes",
             "-o",
+            "ConnectTimeout=6",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=2",
+            "-o",
             "ControlMaster=auto",
             "-o",
             f"ControlPath={self.control_path}",
@@ -120,18 +144,65 @@ class RemoteFileSystem:
 
         try:
             result = subprocess.run(
-                ssh_cmd, capture_output=True, text=True, check=True, timeout=10
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=self.command_timeout,
             )
             return result.stdout
         except subprocess.TimeoutExpired:
             # Control socket might be stuck, reset it and retry once
             self._reset_ssh_control()
             result = subprocess.run(
-                ssh_cmd, capture_output=True, text=True, check=True, timeout=10
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=self.command_timeout,
             )
             return result.stdout
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"SSH command failed: {e.stderr}") from e
+            stderr = e.stderr or ""
+            if self._is_hostkey_mismatch(stderr):
+                raise HostKeyMismatch(self.host, self.port, stderr) from e
+            raise RuntimeError(f"SSH command failed: {stderr}") from e
+
+    def _is_hostkey_mismatch(self, stderr: str) -> bool:
+        return (
+            "REMOTE HOST IDENTIFICATION HAS CHANGED" in stderr
+            or "Host key verification failed" in stderr
+        )
+
+    def _normalize_proxycommand(self, proxycommand: str | None) -> str | None:
+        if not proxycommand:
+            return None
+        if not proxycommand.startswith("ssh "):
+            return proxycommand
+        if "ConnectTimeout=" in proxycommand:
+            return proxycommand
+        # Inject timeouts into the jump ssh to avoid hanging on banner exchange
+        return proxycommand.replace(
+            "ssh ",
+            "ssh -o ConnectTimeout=6 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 ",
+            1,
+        )
+
+    def remove_known_host(self) -> tuple[bool, str]:
+        """Remove stale known_hosts entry for the current host:port."""
+        target = f"[{self.host}]:{self.port}"
+        try:
+            result = subprocess.run(
+                ["ssh-keygen", "-R", target],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            output = (result.stdout or "").strip()
+            return True, output
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            return False, stderr or "ssh-keygen failed"
 
     def list_directory(self, path: str) -> list[FileSystemItem]:
         """List files and directories at path"""
@@ -215,6 +286,357 @@ class RemoteFileSystem:
             result = self._run_ssh_command(cmd)
             return result.strip() == "EXISTS"
         except Exception:
+            return False
+
+
+class S3RemoteFileSystem:
+    """Handle S3 filesystem operations via boto3, mirroring RemoteFileSystem's interface."""
+
+    bucket: str
+    prefix: str  # base prefix (always ends with "/" or is "")
+    _s3: object  # boto3 S3 client
+    cache: dict[str, list[FileSystemItem]]
+
+    def __init__(
+        self,
+        profile: str,
+        bucket: str,
+        prefix: str = "",
+        endpoint_url: str | None = None,
+    ):
+        session = boto3.Session(profile_name=profile)
+        self._s3 = session.client("s3", endpoint_url=endpoint_url or None)
+        self.bucket = bucket
+        self.prefix = prefix.rstrip("/") + "/" if prefix else ""
+        self.cache = {}
+
+    def _full_key(self, path: str) -> str:
+        """Convert a display path (like /models/file.txt) to an S3 key."""
+        # Strip leading slash from display path, prepend base prefix
+        key = path.lstrip("/")
+        if self.prefix:
+            key = self.prefix + key
+        return key
+
+    def _display_path(self, key: str) -> str:
+        """Convert an S3 key back to a display path (leading slash, no base prefix)."""
+        if self.prefix and key.startswith(self.prefix):
+            key = key[len(self.prefix) :]
+        return "/" + key
+
+    def list_directory(self, path: str) -> list[FileSystemItem]:
+        if path in self.cache:
+            return self.cache[path]
+
+        prefix_key = self._full_key(path)
+        if prefix_key and not prefix_key.endswith("/"):
+            prefix_key += "/"
+
+        paginator = self._s3.get_paginator("list_objects_v2")
+        items: list[FileSystemItem] = []
+        seen: set[str] = set()
+
+        for page in paginator.paginate(
+            Bucket=self.bucket, Prefix=prefix_key, Delimiter="/"
+        ):
+            # Common prefixes = subdirectories
+            for cp in page.get("CommonPrefixes") or []:
+                key = cp["Prefix"].rstrip("/")
+                name = key.split("/")[-1]
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                items.append(
+                    {
+                        "name": name,
+                        "display_name": name,
+                        "is_dir": True,
+                        "is_link": False,
+                        "link_target": None,
+                        "perms": "drwxr-xr-x",
+                        "size": "0",
+                        "mtime": "",
+                    }
+                )
+            # Objects = files
+            for obj in page.get("Contents") or []:
+                key = obj["Key"]
+                # Skip the directory placeholder itself
+                if key == prefix_key:
+                    continue
+                name = key[len(prefix_key) :]
+                if not name or "/" in name or name in seen:
+                    continue
+                seen.add(name)
+                mtime = obj["LastModified"].strftime("%Y-%m-%dT%H:%M:%S")
+                items.append(
+                    {
+                        "name": name,
+                        "display_name": name,
+                        "is_dir": False,
+                        "is_link": False,
+                        "link_target": None,
+                        "perms": "-rw-r--r--",
+                        "size": str(obj["Size"]),
+                        "mtime": mtime,
+                    }
+                )
+
+        # Sort: directories first, then files, both alphabetically
+        items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+        self.cache[path] = items
+        return items
+
+    def clear_cache(self, path: str | None = None) -> None:
+        if path:
+            self.cache.pop(path, None)
+        else:
+            self.cache.clear()
+
+    def rename_path(self, old_path: str, new_path: str) -> None:
+        """Rename by copy+delete (S3 has no native rename)."""
+        old_key = self._full_key(old_path)
+        new_key = self._full_key(new_path)
+
+        # Check if it's a "folder" (prefix) by listing
+        paginator = self._s3.get_paginator("list_objects_v2")
+        keys_to_move: list[tuple[str, str]] = []
+
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=old_key):
+            for obj in page.get("Contents") or []:
+                src = obj["Key"]
+                dst = new_key + src[len(old_key) :]
+                keys_to_move.append((src, dst))
+
+        # If nothing found under old_key as prefix, treat as single file
+        if not keys_to_move:
+            keys_to_move = [(old_key, new_key)]
+
+        for src, dst in keys_to_move:
+            self._s3.copy_object(
+                Bucket=self.bucket,
+                CopySource={"Bucket": self.bucket, "Key": src},
+                Key=dst,
+            )
+            self._s3.delete_object(Bucket=self.bucket, Key=src)
+
+    def delete_path(self, target_path: str) -> None:
+        key = self._full_key(target_path)
+        paginator = self._s3.get_paginator("list_objects_v2")
+        deleted_any = False
+
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=key):
+            objects = [{"Key": obj["Key"]} for obj in (page.get("Contents") or [])]
+            if objects:
+                self._s3.delete_objects(Bucket=self.bucket, Delete={"Objects": objects})
+                deleted_any = True
+
+        # Also try deleting an exact key if nothing was found under the prefix
+        if not deleted_any:
+            self._s3.delete_object(Bucket=self.bucket, Key=key)
+
+    def path_exists(self, target_path: str) -> bool:
+        key = self._full_key(target_path)
+        # Check as exact file
+        try:
+            self._s3.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except botocore.exceptions.ClientError:
+            pass
+        # Check as directory prefix
+        resp = self._s3.list_objects_v2(Bucket=self.bucket, Prefix=key + "/", MaxKeys=1)
+        return bool(resp.get("Contents") or resp.get("CommonPrefixes"))
+
+
+class S3FileUploader:
+    """Handle S3 uploads/downloads via boto3, mirroring FileUploader's interface."""
+
+    bucket: str
+    prefix: str
+    _profile: str
+    _endpoint_url: str | None
+    _transfer_config: object
+
+    def __init__(
+        self,
+        profile: str,
+        bucket: str,
+        prefix: str = "",
+        endpoint_url: str | None = None,
+    ):
+        self._profile = profile
+        self._endpoint_url = endpoint_url or None
+        self.bucket = bucket
+        self.prefix = prefix.rstrip("/") + "/" if prefix else ""
+        self._transfer_config = boto3.s3.transfer.TransferConfig(
+            multipart_threshold=8 * 1024 * 1024,
+            max_concurrency=10,
+            multipart_chunksize=8 * 1024 * 1024,
+        )
+
+    def _client(self) -> object:
+        """Create a fresh boto3 client per call (boto3 clients are not thread-safe)."""
+        session = boto3.Session(profile_name=self._profile)
+        return session.client("s3", endpoint_url=self._endpoint_url)
+
+    def _full_key(self, path: str) -> str:
+        key = path.lstrip("/")
+        if self.prefix:
+            key = self.prefix + key
+        return key
+
+    def upload(
+        self,
+        local_path: str,
+        remote_path: str,
+        progress_callback: Callable[[bool | None, str], None] | None = None,
+        custom_name: str | None = None,
+        delete_extra: bool = False,
+    ) -> bool:
+        local = Path(local_path)
+        if not local.exists():
+            if progress_callback:
+                progress_callback(False, f"Not found: {local_path}")
+            return False
+
+        display_name = custom_name or local.name
+        remote_base = remote_path.rstrip("/")
+        dest_display = f"{remote_base}/{display_name}"
+        item_type = "folder" if local.is_dir() else "file"
+
+        try:
+            if local.is_dir():
+                if progress_callback:
+                    progress_callback(
+                        None, f"Uploading folder '{display_name}' to {remote_base}/"
+                    )
+                uploaded = 0
+                skipped_keys: set[str] = set()
+
+                # If delete_extra, collect existing keys under dest prefix first
+                dest_prefix_key = self._full_key(f"{remote_base}/{display_name}")
+                if not dest_prefix_key.endswith("/"):
+                    dest_prefix_key += "/"
+                existing_keys: set[str] = set()
+                s3 = self._client()
+                if delete_extra:
+                    paginator = s3.get_paginator("list_objects_v2")
+                    for page in paginator.paginate(
+                        Bucket=self.bucket, Prefix=dest_prefix_key
+                    ):
+                        for obj in page.get("Contents") or []:
+                            existing_keys.add(obj["Key"])
+
+                uploaded_keys: set[str] = set()
+                for file in local.rglob("*"):
+                    if not file.is_file():
+                        continue
+                    rel = file.relative_to(local.parent)
+                    key = self._full_key(f"{remote_base}/{rel.as_posix()}")
+                    s3.upload_file(
+                        str(file),
+                        self.bucket,
+                        key,
+                        Config=self._transfer_config,
+                    )
+                    uploaded_keys.add(key)
+                    uploaded += 1
+
+                if delete_extra:
+                    to_delete = existing_keys - uploaded_keys
+                    if to_delete:
+                        s3.delete_objects(
+                            Bucket=self.bucket,
+                            Delete={"Objects": [{"Key": k} for k in to_delete]},
+                        )
+
+                if progress_callback:
+                    progress_callback(
+                        True,
+                        f"✅ Folder '{display_name}' written to {dest_display} ({uploaded} files)",
+                    )
+            else:
+                key = self._full_key(f"{remote_base}/{display_name}")
+                size = local.stat().st_size
+
+                if progress_callback:
+                    progress_callback(
+                        None, f"Uploading file '{display_name}' to {remote_base}/"
+                    )
+
+                last_pct: list[int] = [-1]
+
+                def _on_bytes(bytes_transferred: int) -> None:
+                    if size > 0:
+                        pct = int(bytes_transferred * 100 / size)
+                        if pct != last_pct[0] and pct % 10 == 0:
+                            last_pct[0] = pct
+                            if progress_callback:
+                                progress_callback(None, f"  {pct}% of {display_name}")
+
+                self._client().upload_file(
+                    str(local),
+                    self.bucket,
+                    key,
+                    Config=self._transfer_config,
+                    Callback=_on_bytes,
+                )
+                if progress_callback:
+                    progress_callback(
+                        True, f"✅ File '{display_name}' written to {dest_display}"
+                    )
+
+            return True
+
+        except Exception as e:
+            if progress_callback:
+                progress_callback(
+                    False, f"❌ Failed to upload {item_type} '{display_name}': {e}"
+                )
+            return False
+
+    def download(
+        self,
+        remote_path: str,
+        local_dest: str,
+        is_dir: bool,
+        progress_callback: Callable[[bool | None, str], None] | None = None,
+    ) -> bool:
+        local_dest_path = Path(local_dest)
+        name = Path(remote_path).name
+
+        try:
+            if is_dir:
+                prefix_key = self._full_key(remote_path)
+                if not prefix_key.endswith("/"):
+                    prefix_key += "/"
+                local_dest_path.mkdir(parents=True, exist_ok=True)
+                if progress_callback:
+                    progress_callback(None, f"Downloading folder '{name}'...")
+                s3 = self._client()
+                paginator = s3.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix_key):
+                    for obj in page.get("Contents") or []:
+                        rel_key = obj["Key"][len(prefix_key) :]
+                        if not rel_key:
+                            continue
+                        dest_file = local_dest_path / rel_key
+                        dest_file.parent.mkdir(parents=True, exist_ok=True)
+                        s3.download_file(self.bucket, obj["Key"], str(dest_file))
+                if progress_callback:
+                    progress_callback(True, f"✅ Downloaded '{name}'")
+            else:
+                key = self._full_key(remote_path)
+                local_dest_path.parent.mkdir(parents=True, exist_ok=True)
+                if progress_callback:
+                    progress_callback(None, f"Downloading '{name}'...")
+                self._client().download_file(self.bucket, key, str(local_dest_path))
+                if progress_callback:
+                    progress_callback(True, f"✅ Downloaded '{name}'")
+            return True
+        except Exception as e:
+            if progress_callback:
+                progress_callback(False, f"❌ Download failed: {e}")
             return False
 
 
@@ -367,7 +789,20 @@ class FileUploader:
         self.port = port
         self.user = user
         self.identity = identity
-        self.proxycommand = proxycommand
+        self.proxycommand = self._normalize_proxycommand(proxycommand)
+
+    def _normalize_proxycommand(self, proxycommand: str | None) -> str | None:
+        if not proxycommand:
+            return None
+        if not proxycommand.startswith("ssh "):
+            return proxycommand
+        if "ConnectTimeout=" in proxycommand:
+            return proxycommand
+        return proxycommand.replace(
+            "ssh ",
+            "ssh -o ConnectTimeout=6 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 ",
+            1,
+        )
 
     def _build_ssh_args(self) -> str:
         """Build SSH arguments for rsync"""
@@ -583,6 +1018,87 @@ class RemoteListWorker(QtCore.QThread):
     path: str
 
     def __init__(self, remote_fs: RemoteFileSystem, path: str):
+        super().__init__()
+        self.remote_fs = remote_fs
+        self.path = path
+
+    @override
+    def run(self) -> None:
+        try:
+            items = self.remote_fs.list_directory(self.path)
+            self.completed.emit(self.path, items)
+        except HostKeyMismatch as e:
+            msg = f"HOSTKEY_MISMATCH|{e.host}|{e.port}|{e.stderr.strip()}"
+            self.failed.emit(msg)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class S3UploadWorker(QtCore.QThread):
+    progress: QtCore.Signal = QtCore.Signal(str)
+    finished_: QtCore.Signal = QtCore.Signal(bool)
+
+    def __init__(
+        self,
+        uploader: S3FileUploader,
+        local_path: str,
+        remote_path: str,
+        custom_name: str | None = None,
+        delete_extra: bool = False,
+    ):
+        super().__init__()
+        self.uploader = uploader
+        self.local_path = local_path
+        self.remote_path = remote_path
+        self.custom_name = custom_name
+        self.delete_extra = delete_extra
+
+    @override
+    def run(self) -> None:
+        def cb(success: bool | None, message: str) -> None:
+            if message:
+                self.progress.emit(message)
+
+        success = self.uploader.upload(
+            self.local_path, self.remote_path, cb, self.custom_name, self.delete_extra
+        )
+        self.finished_.emit(success)
+
+
+class S3DownloadWorker(QtCore.QThread):
+    progress: QtCore.Signal = QtCore.Signal(str)
+    finished_: QtCore.Signal = QtCore.Signal(bool)
+
+    def __init__(
+        self,
+        uploader: S3FileUploader,
+        remote_path: str,
+        local_dest: str,
+        is_dir: bool,
+    ):
+        super().__init__()
+        self.uploader = uploader
+        self.remote_path = remote_path
+        self.local_dest = local_dest
+        self.is_dir = is_dir
+
+    @override
+    def run(self) -> None:
+        def cb(success: bool | None, message: str) -> None:
+            if message:
+                self.progress.emit(message)
+
+        success = self.uploader.download(
+            self.remote_path, self.local_dest, self.is_dir, cb
+        )
+        self.finished_.emit(success)
+
+
+class S3ListWorker(QtCore.QThread):
+    completed: QtCore.Signal = QtCore.Signal(str, list)
+    failed: QtCore.Signal = QtCore.Signal(str)
+
+    def __init__(self, remote_fs: S3RemoteFileSystem, path: str):
         super().__init__()
         self.remote_fs = remote_fs
         self.path = path
@@ -919,8 +1435,9 @@ class BookmarkList(QtWidgets.QListWidget):
 
 class UploaderWindow(QtWidgets.QMainWindow):
     host_info: dict[str, str] | None
-    remote_fs: RemoteFileSystem | None
-    uploader: FileUploader | None
+    remote_fs: RemoteFileSystem | S3RemoteFileSystem | None
+    uploader: FileUploader | S3FileUploader | None
+    _is_s3: bool
     current_remote_path: str
     workers: list[QtCore.QThread]
     _initializing_hosts: bool
@@ -947,8 +1464,12 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.host_info = None
         self.remote_fs = None
         self.uploader = None
+        self._is_s3 = False
         self.current_remote_path = "/"
         self.workers = []
+        self._upload_queue: list[S3UploadWorker] = []
+        self._active_s3_uploads = 0
+        self._max_s3_uploads = 3
         self._initializing_hosts = False
         self.folder_workers = {}
         self._refresh_expand_flag = True
@@ -997,20 +1518,61 @@ class UploaderWindow(QtWidgets.QMainWindow):
                 self.bookmark_list.addItem(item)
 
     def connect_to_host(self) -> None:
-        """Connect to the selected host"""
+        """Connect to the selected host (SSH or S3)"""
         host = self.host_combo.currentText()
         if not host:
             return
 
+        # Reset upload queue on host switch
+        self._upload_queue.clear()
+        self._active_s3_uploads = 0
+
+        # Check if this is an S3 host
+        s3_cfg = get_s3_host_config(host)
+        if s3_cfg is not None:
+            try:
+                self._is_s3 = True
+                self.host_info = None
+                endpoint_url = s3_cfg.get("endpoint_url") or None
+                self.remote_fs = S3RemoteFileSystem(
+                    profile=s3_cfg["profile"],
+                    bucket=s3_cfg["bucket"],
+                    prefix=s3_cfg.get("prefix", ""),
+                    endpoint_url=endpoint_url,
+                )
+                self.uploader = S3FileUploader(
+                    profile=s3_cfg["profile"],
+                    bucket=s3_cfg["bucket"],
+                    prefix=s3_cfg.get("prefix", ""),
+                    endpoint_url=endpoint_url,
+                )
+                self.current_remote_path = "/"
+                self.path_edit.setText("/")
+                self.log_box.appendPlainText(
+                    f"Connected to S3 bucket '{s3_cfg['bucket']}' (profile: {s3_cfg['profile']})"
+                )
+                self._initialize_folder_view()
+                self.refresh_remote_view()
+                self._update_bookmark_list()
+            except Exception as e:
+                self.log_box.appendPlainText(
+                    f"Failed to connect to S3 host {host}: {e}"
+                )
+            return
+
+        # SSH host
         try:
+            self._is_s3 = False
             ssh_config = SSHConfig()
             self.host_info = ssh_config.get_host_info(host)
+            command_timeout = 30 if self.host_info.get("proxycommand") else 10
             self.remote_fs = RemoteFileSystem(
                 host=self.host_info["hostname"],
                 port=self.host_info["port"],
                 user=self.host_info["user"],
                 identity=self.host_info["identity"],
                 proxycommand=self.host_info.get("proxycommand"),
+                command_timeout=command_timeout,
             )
             self.uploader = FileUploader(
                 host=self.host_info["hostname"],
@@ -1027,17 +1589,19 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self.log_box.appendPlainText(f"Failed to connect to {host}: {e}")
 
     def _populate_hosts(self) -> None:
-        """Populate host dropdown from SSH config"""
+        """Populate host dropdown from SSH config and s3_hosts.json"""
         self._initializing_hosts = True
         self.host_combo.clear()
         try:
             ssh_config = SSHConfig()
             hosts = ssh_config.list_hosts()
-            self.host_combo.addItems(hosts)
-            if hosts:
+            s3_hosts = get_s3_host_names()
+            all_hosts = hosts + s3_hosts
+            self.host_combo.addItems(all_hosts)
+            if all_hosts:
                 # Try to select vast-ai by default, otherwise use first host
                 try:
-                    vast_index = hosts.index("vast-ai")
+                    vast_index = all_hosts.index("vast-ai")
                     self.host_combo.setCurrentIndex(vast_index)
                 except ValueError:
                     self.host_combo.setCurrentIndex(0)
@@ -1086,7 +1650,10 @@ class UploaderWindow(QtWidgets.QMainWindow):
         if not self.remote_fs:
             return
 
-        worker = RemoteListWorker(self.remote_fs, path)
+        if self._is_s3:
+            worker: QtCore.QThread = S3ListWorker(self.remote_fs, path)  # type: ignore[arg-type]
+        else:
+            worker = RemoteListWorker(self.remote_fs, path)  # type: ignore[arg-type]
 
         def on_complete(p: str, items: list[FileSystemItem]) -> None:
             if p != path:
@@ -1263,27 +1830,56 @@ class UploaderWindow(QtWidgets.QMainWindow):
                     self.log_box.appendPlainText(
                         f"📝 Renaming {original_name} → {custom_name} during upload"
                     )
-                    worker = UploadWorker(
-                        self.uploader, path, remote_path, custom_name, False
-                    )
+                    upload_custom_name: str | None = custom_name
+                    upload_delete_extra = False
                 else:
-                    # Overwrite: use rsync --delete to sync and remove extra files
-                    self.log_box.appendPlainText(
-                        f"♻️ Syncing {item_type} '{original_name}' (rsync will update and remove extra files)"
-                    )
-                    worker = UploadWorker(self.uploader, path, remote_path, None, True)
+                    # Overwrite: sync and remove extra files
+                    if not self._is_s3:
+                        self.log_box.appendPlainText(
+                            f"♻️ Syncing {item_type} '{original_name}' (rsync will update and remove extra files)"
+                        )
+                    upload_custom_name = None
+                    upload_delete_extra = True
             else:
                 # No conflict, upload normally
-                worker = UploadWorker(self.uploader, path, remote_path, None, False)
+                upload_custom_name = None
+                upload_delete_extra = False
 
-            worker.progress.connect(self._log_upload_progress)
-            worker.finished_.connect(
-                lambda success, target=remote_path: self._on_upload_complete(
-                    success, target
+            if self._is_s3:
+                worker: S3UploadWorker = S3UploadWorker(
+                    self.uploader,  # type: ignore[arg-type]
+                    path,
+                    remote_path,
+                    upload_custom_name,
+                    upload_delete_extra,
                 )
-            )
-            self.workers.append(worker)
-            worker.start()
+                worker.progress.connect(self._log_upload_progress)
+                worker.finished_.connect(
+                    lambda success, target=remote_path: self._on_s3_upload_complete(
+                        success, target
+                    )
+                )
+                self.workers.append(worker)
+                self._upload_queue.append(worker)
+            else:
+                ssh_worker = UploadWorker(  # type: ignore[arg-type]
+                    self.uploader,  # type: ignore[arg-type]
+                    path,
+                    remote_path,
+                    upload_custom_name,
+                    upload_delete_extra,
+                )
+                ssh_worker.progress.connect(self._log_upload_progress)
+                ssh_worker.finished_.connect(
+                    lambda success, target=remote_path: self._on_upload_complete(
+                        success, target
+                    )
+                )
+                self.workers.append(ssh_worker)
+                ssh_worker.start()
+
+        if self._is_s3:
+            self._drain_upload_queue()
 
     def _log_upload_progress(self, message: str) -> None:
         """Filter and format upload progress messages"""
@@ -1302,6 +1898,24 @@ class UploaderWindow(QtWidgets.QMainWindow):
         # Refresh the folder tree if the upload destination is expanded
         if target_path in self.expanded_folders:
             self._refresh_expanded_folder(target_path)
+
+    def _drain_upload_queue(self) -> None:
+        """Start queued S3 upload workers up to the concurrency limit."""
+        while self._upload_queue and self._active_s3_uploads < self._max_s3_uploads:
+            worker = self._upload_queue.pop(0)
+            self._active_s3_uploads += 1
+            remaining = len(self._upload_queue)
+            if remaining:
+                self.log_box.appendPlainText(
+                    f"⏳ Starting upload ({remaining} more queued)..."
+                )
+            worker.start()
+
+    def _on_s3_upload_complete(self, success: bool, target_path: str) -> None:
+        """Handle S3 upload completion - decrement counter and drain queue."""
+        self._active_s3_uploads = max(0, self._active_s3_uploads - 1)
+        self._drain_upload_queue()
+        self._on_upload_complete(success, target_path)
 
     def handle_rename(self, path: str, name: str) -> None:
         """Handle rename request"""
@@ -1371,7 +1985,12 @@ class UploaderWindow(QtWidgets.QMainWindow):
         if not dest_path:
             return
 
-        worker = DownloadWorker(self.uploader, path, dest_path, is_dir)
+        if self._is_s3:
+            worker: QtCore.QThread = S3DownloadWorker(
+                self.uploader, path, dest_path, is_dir
+            )  # type: ignore[arg-type]
+        else:
+            worker = DownloadWorker(self.uploader, path, dest_path, is_dir)  # type: ignore[arg-type]
         worker.progress.connect(self.log_box.appendPlainText)
         worker.finished_.connect(
             lambda success: self.log_box.appendPlainText(
@@ -1463,7 +2082,12 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.status_label.setText("Loading...")
         self.model.removeRows(0, self.model.rowCount())
 
-        worker = RemoteListWorker(self.remote_fs, self.current_remote_path)
+        if self._is_s3:
+            worker: QtCore.QThread = S3ListWorker(
+                self.remote_fs, self.current_remote_path
+            )  # type: ignore[arg-type]
+        else:
+            worker = RemoteListWorker(self.remote_fs, self.current_remote_path)  # type: ignore[arg-type]
         worker.completed.connect(self._on_list_completed)
         worker.failed.connect(self._on_list_failed)
         self.workers.append(worker)
@@ -1532,9 +2156,75 @@ class UploaderWindow(QtWidgets.QMainWindow):
 
     def _on_list_failed(self, error: str) -> None:
         """Handle list failure"""
-        self.log_box.appendPlainText(f"Error listing directory: {error}")
-        self.status_label.setText("Error!")
+        if error.startswith("HOSTKEY_MISMATCH|"):
+            parts = error.split("|", 3)
+            host = parts[1] if len(parts) > 1 else ""
+            port = parts[2] if len(parts) > 2 else ""
+            details = parts[3] if len(parts) > 3 else ""
+            self._prompt_hostkey_fix(host, port, details)
+        else:
+            if self._is_proxy_timeout(error):
+                self.log_box.appendPlainText(
+                    "Error listing directory: SSH connection timed out during banner exchange."
+                )
+                self.log_box.appendPlainText(
+                    "Likely causes: jump host is down/unreachable, ProxyCommand target is wrong, or the forwarded port is closed."
+                )
+                self.log_box.appendPlainText(
+                    "Check the jump host first, then the target host/port mapping."
+                )
+            else:
+                self.log_box.appendPlainText(f"Error listing directory: {error}")
+            self.status_label.setText("Error!")
         self.workers = [w for w in self.workers if not w.isFinished()]
+
+    def _prompt_hostkey_fix(self, host: str, port: str, details: str) -> None:
+        if not self.remote_fs:
+            self.log_box.appendPlainText(
+                "Host key mismatch detected, but no host is active."
+            )
+            return
+        msg = QtWidgets.QMessageBox(self)
+        msg.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        msg.setWindowTitle("SSH Host Key Changed")
+        msg.setText(
+            "The SSH host key changed for this host. The connection was blocked."
+        )
+        informative = "Fixing this will remove the old known_hosts entry and retry."
+        if host and port:
+            informative += f"\nHost: {host}\nPort: {port}"
+        msg.setInformativeText(informative)
+        if details:
+            msg.setDetailedText(details.strip())
+        fix_btn = msg.addButton(
+            "Fix Host Key", QtWidgets.QMessageBox.ButtonRole.AcceptRole
+        )
+        msg.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+
+        if msg.clickedButton() != fix_btn:
+            self.status_label.setText("Host key mismatch.")
+            return
+
+        ok, output = self.remote_fs.remove_known_host()
+        if ok:
+            self.log_box.appendPlainText("Removed stale host key; retrying...")
+            if output:
+                self.log_box.appendPlainText(output)
+            if self.remote_fs:
+                self.remote_fs.clear_cache()
+            self.refresh_remote_view()
+            self._initialize_folder_view()
+        else:
+            self.log_box.appendPlainText(f"Failed to update known_hosts: {output}")
+            self.status_label.setText("Error!")
+
+    def _is_proxy_timeout(self, error: str) -> bool:
+        return (
+            "banner exchange" in error
+            or "Connection to UNKNOWN port 65535" in error
+            or "UNKNOWN-65535" in error
+        )
 
     def on_host_changed(self, host: str) -> None:
         """Handle host change"""

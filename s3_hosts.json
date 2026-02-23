@@ -1,0 +1,8 @@
+{
+  "PhilBetter": {
+    "profile": "philbetter",
+    "bucket": "philbetter",
+    "prefix": "",
+    "endpoint_url": "https://s3.us-west-1.wasabisys.com"
+  }
+}
