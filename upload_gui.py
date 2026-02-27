@@ -1891,13 +1891,16 @@ class UploaderWindow(QtWidgets.QMainWindow):
         if not success:
             return
 
-        # Refresh the detailed view if it's showing the upload destination
-        if self.current_remote_path == target_path:
+        parent_path = str(Path(target_path).parent)
+
+        # Refresh the detailed view if it's showing the upload destination or its parent
+        if self.current_remote_path in (target_path, parent_path):
             self.refresh_remote_view(force=True)
 
-        # Refresh the folder tree if the upload destination is expanded
-        if target_path in self.expanded_folders:
-            self._refresh_expanded_folder(target_path)
+        # Refresh the folder tree for the destination and its parent (whichever is expanded)
+        for path in (target_path, parent_path):
+            if path in self.expanded_folders:
+                self._refresh_expanded_folder(path)
 
     def _drain_upload_queue(self) -> None:
         """Start queued S3 upload workers up to the concurrency limit."""
@@ -2163,18 +2166,14 @@ class UploaderWindow(QtWidgets.QMainWindow):
             details = parts[3] if len(parts) > 3 else ""
             self._prompt_hostkey_fix(host, port, details)
         else:
+            self.log_box.appendPlainText(f"Error listing directory: {error}")
             if self._is_proxy_timeout(error):
                 self.log_box.appendPlainText(
-                    "Error listing directory: SSH connection timed out during banner exchange."
-                )
-                self.log_box.appendPlainText(
-                    "Likely causes: jump host is down/unreachable, ProxyCommand target is wrong, or the forwarded port is closed."
+                    "Possible cause: jump host is down/unreachable, ProxyCommand target is wrong, or the forwarded port is closed."
                 )
                 self.log_box.appendPlainText(
                     "Check the jump host first, then the target host/port mapping."
                 )
-            else:
-                self.log_box.appendPlainText(f"Error listing directory: {error}")
             self.status_label.setText("Error!")
         self.workers = [w for w in self.workers if not w.isFinished()]
 
