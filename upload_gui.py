@@ -23,7 +23,7 @@ import botocore.exceptions
 from PySide6 import QtCore, QtGui, QtWidgets
 from typing_extensions import override
 
-from common import SSHConfig, get_s3_host_config, get_s3_host_names
+from common import SSHConfig, get_s3_host_config, get_s3_host_names, resolve_vast_endpoint
 
 
 class FileSystemItem(TypedDict):
@@ -1565,23 +1565,40 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self._is_s3 = False
             ssh_config = SSHConfig()
             self.host_info = ssh_config.get_host_info(host)
+            resolved_host = self.host_info["hostname"]
+            resolved_port = self.host_info["port"]
+            endpoint = resolve_vast_endpoint(resolved_host, 2222)
+            if endpoint:
+                resolved_host = endpoint["host"]
+                resolved_port = endpoint["port"]
+                if (
+                    resolved_host != self.host_info["hostname"]
+                    or resolved_port != self.host_info["port"]
+                ):
+                    self.log_box.appendPlainText(
+                        "Using Vast.ai mapped endpoint "
+                        f"{resolved_host}:{resolved_port}"
+                    )
+
             command_timeout = 30 if self.host_info.get("proxycommand") else 10
             self.remote_fs = RemoteFileSystem(
-                host=self.host_info["hostname"],
-                port=self.host_info["port"],
+                host=resolved_host,
+                port=resolved_port,
                 user=self.host_info["user"],
                 identity=self.host_info["identity"],
                 proxycommand=self.host_info.get("proxycommand"),
                 command_timeout=command_timeout,
             )
             self.uploader = FileUploader(
-                host=self.host_info["hostname"],
-                port=self.host_info["port"],
+                host=resolved_host,
+                port=resolved_port,
                 user=self.host_info["user"],
                 identity=self.host_info["identity"],
                 proxycommand=self.host_info.get("proxycommand"),
             )
-            self.log_box.appendPlainText(f"Connected to {host}")
+            self.log_box.appendPlainText(
+                f"Connected to {host} ({resolved_host}:{resolved_port})"
+            )
             self._initialize_folder_view()
             self.refresh_remote_view()
             self._update_bookmark_list()

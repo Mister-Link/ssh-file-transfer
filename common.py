@@ -50,6 +50,11 @@ class VastInstance(TypedDict):
     ports: dict[str, list[VastPort]]
 
 
+class ResolvedVastEndpoint(TypedDict):
+    host: str
+    port: str
+
+
 class SSHConfig:
     """Parse SSH config to get connection details"""
 
@@ -195,3 +200,28 @@ def _resolve_vast_port(hostname: str, container_port: int) -> str | None:
         return None
 
     return str(host_port)
+
+
+def resolve_vast_endpoint(
+    hostname: str, container_port: int = 2222
+) -> ResolvedVastEndpoint | None:
+    """Resolve a Vast.ai SSH endpoint to public_ip:host_port for a container port."""
+    inst = _load_vast_instance_for_host(hostname)
+    if not inst:
+        return None
+
+    host = inst.get("public_ipaddr")
+    if not host:
+        return None
+
+    ports = inst.get("ports", {})
+    key = f"{container_port}/tcp"
+    entries = ports.get(key) or []
+    if not entries:
+        return None
+
+    host_port = entries[0].get("HostPort")
+    if not host_port:
+        return None
+
+    return {"host": host, "port": str(host_port)}

@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from common import SSHConfig, _resolve_vast_port
+from common import SSHConfig, resolve_vast_endpoint
 
 
 class FileUploader:
@@ -203,12 +203,16 @@ Examples:
         identity = host_info.get("identity", "")
 
         if shutil.which("hpnssh") and hostname:
-            mapped_port = _resolve_vast_port(hostname, 2222)
-            if mapped_port:
-                if mapped_port != str(port):
+            endpoint = resolve_vast_endpoint(hostname, 2222)
+            if endpoint:
+                mapped_host = endpoint["host"]
+                mapped_port = endpoint["port"]
+                if mapped_host != hostname or mapped_port != str(port):
                     print(
-                        f"ℹ️ Using Vast.ai mapped port {mapped_port} for container port 2222"
+                        "ℹ️ Using Vast.ai mapped endpoint "
+                        f"{mapped_host}:{mapped_port} for container port 2222"
                     )
+                hostname = mapped_host
                 port = mapped_port
 
         print(f"🔗 Connecting to {user}@{hostname}:{port}")
