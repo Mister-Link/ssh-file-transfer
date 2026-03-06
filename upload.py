@@ -51,6 +51,7 @@ class FileUploader:
             ssh_args += f" -i {self.identity}"
         ssh_args += (
             " -o StrictHostKeyChecking=no -o BatchMode=yes"
+            " -o ClearAllForwardings=yes"
             " -o Compression=no -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"
         )
         return ssh_args
