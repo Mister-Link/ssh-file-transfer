@@ -56,6 +56,28 @@ class FileUploader:
         )
         return ssh_args
 
+    def _ensure_remote_rsync(self) -> None:
+        """Ensure rsync is installed on the remote host."""
+        if getattr(self, "_rsync_checked", False):
+            return
+
+        import shlex
+
+        ssh_cmd = shlex.split(self._build_ssh_args())
+        cmd = ssh_cmd + [
+            f"{self.user}@{self.host}",
+            "command -v rsync >/dev/null 2>&1 || "
+            "(sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y rsync) || "
+            "(apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y rsync)",
+        ]
+
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+            self._rsync_checked = True
+        except subprocess.CalledProcessError:
+            # Fail gracefully, the actual rsync command will fail and show its error if rsync is still missing
+            pass
+
     def upload_file(
         self, local_path: str, remote_subpath: str = ""
     ) -> tuple[bool, str]:
@@ -64,6 +86,8 @@ class FileUploader:
 
         if not path_obj.exists():
             return False, f"File not found: {path_obj}"
+
+        self._ensure_remote_rsync()
 
         # Construct remote path
         remote_dest = f"{self.user}@{self.host}:{self.remote_path}"
@@ -104,6 +128,8 @@ class FileUploader:
         if not path_obj.is_dir():
             print(f"❌ Not a directory: {path_obj}")
             return
+
+        self._ensure_remote_rsync()
 
         # Use rsync for the whole folder (faster than individual files)
         remote_dest = f"{self.user}@{self.host}:{self.remote_path}"

@@ -23,7 +23,12 @@ import botocore.exceptions
 from PySide6 import QtCore, QtGui, QtWidgets
 from typing_extensions import override
 
-from common import SSHConfig, get_s3_host_config, get_s3_host_names, resolve_vast_endpoint
+from common import (
+    SSHConfig,
+    get_s3_host_config,
+    get_s3_host_names,
+    resolve_vast_endpoint,
+)
 
 
 class FileSystemItem(TypedDict):
@@ -820,6 +825,41 @@ class FileUploader:
             ssh_args += f" -o 'ProxyCommand={self.proxycommand}'"
         return ssh_args
 
+    def _ensure_remote_rsync(
+        self, progress_callback: Callable[[bool | None, str], None] | None = None
+    ) -> None:
+        """Ensure rsync is installed on the remote host."""
+        if getattr(self, "_rsync_checked", False):
+            return
+
+        import shlex
+
+        ssh_cmd = shlex.split(self._build_ssh_args())
+        cmd = ssh_cmd + [
+            f"{self.user}@{self.host}",
+            "command -v rsync >/dev/null 2>&1 || "
+            "(sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y rsync) || "
+            "(apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y rsync)",
+        ]
+
+        if progress_callback:
+            progress_callback(None, "Checking remote rsync installation...")
+
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+            self._rsync_checked = True
+        except subprocess.CalledProcessError as e:
+            # We fail gracefully here and let the actual rsync command fail natively if rsync is still missing
+            err_msg = (
+                e.stderr.decode("utf-8")
+                if isinstance(e.stderr, bytes)
+                else (e.stderr or "")
+            )
+            if progress_callback and err_msg.strip():
+                progress_callback(
+                    False, f"Warning: Remote rsync setup failed: {err_msg.strip()}"
+                )
+
     def upload(
         self,
         local_path: str,
@@ -842,6 +882,8 @@ class FileUploader:
             if progress_callback:
                 progress_callback(False, f"Not found: {local_path_obj}")
             return False
+
+        self._ensure_remote_rsync(progress_callback)
 
         remote_base = remote_path.rstrip("/")
         display_name = custom_name or local_path_obj.name
@@ -913,6 +955,8 @@ class FileUploader:
         """Download file or folder from remote"""
         local_dest_path = Path(local_dest)
         local_dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._ensure_remote_rsync(progress_callback)
 
         source = f"{self.user}@{self.host}:{remote_path}"
         if is_dir:
@@ -1576,8 +1620,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
                     or resolved_port != self.host_info["port"]
                 ):
                     self.log_box.appendPlainText(
-                        "Using Vast.ai mapped endpoint "
-                        f"{resolved_host}:{resolved_port}"
+                        f"Using Vast.ai mapped endpoint {resolved_host}:{resolved_port}"
                     )
 
             command_timeout = 30 if self.host_info.get("proxycommand") else 10
