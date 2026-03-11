@@ -25,9 +25,10 @@ from typing_extensions import override
 
 from common import (
     SSHConfig,
+    diagnose_proxycommand_failure,
     get_s3_host_config,
     get_s3_host_names,
-    resolve_vast_endpoint,
+    resolve_ssh_connection_candidates,
 )
 
 
@@ -64,6 +65,7 @@ class RemoteFileSystem:
     control_path: str
     cache: dict[str, list[FileSystemItem]]
     proxycommand: str | None
+    ssh_target: str | None
     command_timeout: int
 
     def __init__(
@@ -73,6 +75,7 @@ class RemoteFileSystem:
         user: str,
         identity: str,
         proxycommand: str | None = None,
+        ssh_target: str | None = None,
         command_timeout: int = 10,
     ):
         self.host = host
@@ -80,6 +83,7 @@ class RemoteFileSystem:
         self.user = user
         self.identity = identity
         self.proxycommand = self._normalize_proxycommand(proxycommand)
+        self.ssh_target = ssh_target
         self.command_timeout = command_timeout
         self.control_path = str(
             Path(tempfile.gettempdir()) / f"uploader-ssh-{os.getpid()}"
@@ -99,7 +103,7 @@ class RemoteFileSystem:
                             "exit",
                             "-o",
                             f"ControlPath={self.control_path}",
-                            f"{self.user}@{self.host}",
+                            self.ssh_target or f"{self.user}@{self.host}",
                         ],
                         capture_output=True,
                         timeout=5,
@@ -119,8 +123,6 @@ class RemoteFileSystem:
             raise RuntimeError("hpnssh not found; install HPN-SSH to use the uploader.")
         ssh_cmd = [
             ssh_bin,
-            "-p",
-            self.port,
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
@@ -139,13 +141,16 @@ class RemoteFileSystem:
             "ControlPersist=60",
         ]
 
-        if self.proxycommand:
-            ssh_cmd.extend(["-o", f"ProxyCommand={self.proxycommand}"])
+        if self.ssh_target:
+            ssh_cmd.extend(["-F", str(Path("~/.ssh/config").expanduser())])
+        else:
+            ssh_cmd.extend(["-p", self.port])
+            if self.proxycommand:
+                ssh_cmd.extend(["-o", f"ProxyCommand={self.proxycommand}"])
+            if self.identity:
+                ssh_cmd.extend(["-i", self.identity])
 
-        if self.identity:
-            ssh_cmd.extend(["-i", self.identity])
-
-        ssh_cmd.extend([f"{self.user}@{self.host}", command])
+        ssh_cmd.extend([self.ssh_target or f"{self.user}@{self.host}", command])
 
         try:
             result = subprocess.run(
@@ -171,7 +176,17 @@ class RemoteFileSystem:
             stderr = e.stderr or ""
             if self._is_hostkey_mismatch(stderr):
                 raise HostKeyMismatch(self.host, self.port, stderr) from e
+            diagnostic = self._proxy_diagnostic(stderr)
+            if diagnostic:
+                raise RuntimeError(f"SSH command failed: {stderr}\n\nProxyCommand failed locally: {diagnostic}") from e
             raise RuntimeError(f"SSH command failed: {stderr}") from e
+
+    def _proxy_diagnostic(self, stderr: str) -> str | None:
+        if not self.proxycommand:
+            return None
+        if "UNKNOWN port 65535" not in stderr and "UNKNOWN-65535" not in stderr:
+            return None
+        return diagnose_proxycommand_failure(self.proxycommand)
 
     def _is_hostkey_mismatch(self, stderr: str) -> bool:
         return (
@@ -192,6 +207,10 @@ class RemoteFileSystem:
             "ssh -o ConnectTimeout=6 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 ",
             1,
         )
+
+    def probe_connection(self) -> None:
+        """Verify that this SSH route accepts a command."""
+        _ = self._run_ssh_command("true")
 
     def remove_known_host(self) -> tuple[bool, str]:
         """Remove stale known_hosts entry for the current host:port."""
@@ -781,6 +800,7 @@ class FileUploader:
     user: str
     identity: str
     proxycommand: str | None
+    ssh_target: str | None
 
     def __init__(
         self,
@@ -789,12 +809,14 @@ class FileUploader:
         user: str,
         identity: str,
         proxycommand: str | None = None,
+        ssh_target: str | None = None,
     ):
         self.host = host
         self.port = port
         self.user = user
         self.identity = identity
         self.proxycommand = self._normalize_proxycommand(proxycommand)
+        self.ssh_target = ssh_target
 
     def _normalize_proxycommand(self, proxycommand: str | None) -> str | None:
         if not proxycommand:
@@ -814,9 +836,13 @@ class FileUploader:
         ssh_bin = shutil.which("hpnssh")
         if not ssh_bin:
             raise RuntimeError("hpnssh not found; install HPN-SSH to use the uploader.")
-        ssh_args = f"{ssh_bin} -p {self.port}"
-        if self.identity:
-            ssh_args += f" -i {self.identity}"
+        ssh_args = f"{ssh_bin}"
+        if self.ssh_target:
+            ssh_args += f" -F {shlex.quote(str(Path('~/.ssh/config').expanduser()))}"
+        else:
+            ssh_args += f" -p {self.port}"
+            if self.identity:
+                ssh_args += f" -i {self.identity}"
         ssh_args += (
             " -o StrictHostKeyChecking=no -o BatchMode=yes"
             " -o Compression=no -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"
@@ -894,9 +920,11 @@ class FileUploader:
 
         # If custom_name is provided, upload directly to that path
         if custom_name:
-            remote_dest = f"{self.user}@{self.host}:{remote_base}/{custom_name}"
+            target = self.ssh_target or f"{self.user}@{self.host}"
+            remote_dest = f"{target}:{remote_base}/{custom_name}"
         else:
-            remote_dest = f"{self.user}@{self.host}:{remote_base}"
+            target = self.ssh_target or f"{self.user}@{self.host}"
+            remote_dest = f"{target}:{remote_base}"
 
         cmd = [
             "rsync",
@@ -916,7 +944,8 @@ class FileUploader:
             # No trailing slash on source = copy the folder itself
             local_str = str(local_path_obj)
             if not custom_name:
-                remote_dest = f"{self.user}@{self.host}:{remote_base}/"
+                target = self.ssh_target or f"{self.user}@{self.host}"
+                remote_dest = f"{target}:{remote_base}/"
         else:
             local_str = str(local_path_obj)
         cmd.extend([local_str, remote_dest])
@@ -1609,38 +1638,73 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self._is_s3 = False
             ssh_config = SSHConfig()
             self.host_info = ssh_config.get_host_info(host)
-            resolved_host = self.host_info["hostname"]
-            resolved_port = self.host_info["port"]
-            endpoint = resolve_vast_endpoint(resolved_host, 2222)
-            if endpoint:
-                resolved_host = endpoint["host"]
-                resolved_port = endpoint["port"]
-                if (
-                    resolved_host != self.host_info["hostname"]
-                    or resolved_port != self.host_info["port"]
-                ):
+            connections = resolve_ssh_connection_candidates(self.host_info, 2222)
+            last_error: Exception | None = None
+
+            for index, connection in enumerate(connections):
+                resolved_host = connection["host"]
+                resolved_port = connection["port"]
+                proxycommand = connection["proxycommand"]
+                ssh_target = connection["ssh_target"]
+
+                if connection["used_vast_endpoint"]:
                     self.log_box.appendPlainText(
                         f"Using Vast.ai mapped endpoint {resolved_host}:{resolved_port}"
                     )
+                    if self.host_info.get("proxycommand"):
+                        self.log_box.appendPlainText(
+                            "Using direct Vast.ai endpoint; bypassing configured jump host."
+                        )
+                elif index > 0 and self.host_info.get("proxycommand"):
+                    self.log_box.appendPlainText(
+                        "Direct Vast.ai endpoint failed; falling back to SSH config route."
+                    )
 
-            command_timeout = 30 if self.host_info.get("proxycommand") else 10
-            self.remote_fs = RemoteFileSystem(
-                host=resolved_host,
-                port=resolved_port,
-                user=self.host_info["user"],
-                identity=self.host_info["identity"],
-                proxycommand=self.host_info.get("proxycommand"),
-                command_timeout=command_timeout,
-            )
-            self.uploader = FileUploader(
-                host=resolved_host,
-                port=resolved_port,
-                user=self.host_info["user"],
-                identity=self.host_info["identity"],
-                proxycommand=self.host_info.get("proxycommand"),
-            )
+                command_timeout = 30 if proxycommand else 10
+                remote_fs = RemoteFileSystem(
+                    host=resolved_host,
+                    port=resolved_port,
+                    user=self.host_info["user"],
+                    identity=self.host_info["identity"],
+                    proxycommand=proxycommand,
+                    ssh_target=ssh_target,
+                    command_timeout=command_timeout,
+                )
+                uploader = FileUploader(
+                    host=resolved_host,
+                    port=resolved_port,
+                    user=self.host_info["user"],
+                    identity=self.host_info["identity"],
+                    proxycommand=proxycommand,
+                    ssh_target=ssh_target,
+                )
+
+                try:
+                    remote_fs.probe_connection()
+                except HostKeyMismatch:
+                    self.remote_fs = remote_fs
+                    self.uploader = uploader
+                    break
+                except Exception as e:
+                    last_error = e
+                    if index + 1 < len(connections):
+                        self.log_box.appendPlainText(
+                            f"SSH route failed for {resolved_host}:{resolved_port}: {e}"
+                        )
+                        continue
+                    raise
+
+                self.remote_fs = remote_fs
+                self.uploader = uploader
+                break
+
+            if not self.remote_fs or not self.uploader:
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError("No working SSH route found")
+
             self.log_box.appendPlainText(
-                f"Connected to {host} ({resolved_host}:{resolved_port})"
+                f"Connected to {host} ({self.remote_fs.host}:{self.remote_fs.port})"
             )
             self._initialize_folder_view()
             self.refresh_remote_view()
@@ -2227,9 +2291,9 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self._prompt_hostkey_fix(host, port, details)
         else:
             self.log_box.appendPlainText(f"Error listing directory: {error}")
-            if self._is_proxy_timeout(error):
+            if self._is_route_error(error):
                 self.log_box.appendPlainText(
-                    "Possible cause: jump host is down/unreachable, ProxyCommand target is wrong, or the forwarded port is closed."
+                    "Possible cause: jump host is down/unreachable, ProxyCommand target is wrong, or the Vast.ai forwarded port is closed/stale."
                 )
                 self.log_box.appendPlainText(
                     "Check the jump host first, then the target host/port mapping."
@@ -2278,11 +2342,13 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self.log_box.appendPlainText(f"Failed to update known_hosts: {output}")
             self.status_label.setText("Error!")
 
-    def _is_proxy_timeout(self, error: str) -> bool:
+    def _is_route_error(self, error: str) -> bool:
         return (
             "banner exchange" in error
             or "Connection to UNKNOWN port 65535" in error
             or "UNKNOWN-65535" in error
+            or "kex_exchange_identification" in error
+            or "Connection reset by peer" in error
         )
 
     def on_host_changed(self, host: str) -> None:

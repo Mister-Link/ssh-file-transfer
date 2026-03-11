@@ -7,12 +7,13 @@ Uses parallel transfers for speed and reads connection info from SSH config
 from __future__ import annotations
 
 import argparse
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from common import SSHConfig, resolve_vast_endpoint
+from common import SSHConfig, diagnose_proxycommand_failure, resolve_ssh_connection_candidates
 
 
 class FileUploader:
@@ -24,6 +25,8 @@ class FileUploader:
     identity: str
     remote_path: str
     max_workers: int
+    proxycommand: str | None
+    ssh_target: str | None
 
     def __init__(
         self,
@@ -33,6 +36,8 @@ class FileUploader:
         identity: str,
         remote_path: str = "/home/user/",
         max_workers: int = 4,
+        proxycommand: str | None = None,
+        ssh_target: str | None = None,
     ):
         self.host = host
         self.port = port
@@ -40,32 +45,70 @@ class FileUploader:
         self.identity = identity
         self.remote_path = remote_path
         self.max_workers = max_workers
+        self.proxycommand = self._normalize_proxycommand(proxycommand)
+        self.ssh_target = ssh_target
+
+    def _normalize_proxycommand(self, proxycommand: str | None) -> str | None:
+        if not proxycommand:
+            return None
+        if not proxycommand.startswith("ssh "):
+            return proxycommand
+        if "ConnectTimeout=" in proxycommand:
+            return proxycommand
+        return proxycommand.replace(
+            "ssh ",
+            "ssh -o ConnectTimeout=6 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 ",
+            1,
+        )
 
     def _build_ssh_args(self) -> str:
         """Build SSH arguments for rsync"""
         ssh_bin = shutil.which("hpnssh")
         if not ssh_bin:
             raise RuntimeError("hpnssh not found; install HPN-SSH to upload.")
-        ssh_args = f"{ssh_bin} -p {self.port}"
-        if self.identity:
-            ssh_args += f" -i {self.identity}"
+        ssh_args = f"{ssh_bin}"
+        if self.ssh_target:
+            ssh_args += f" -F {shlex.quote(str(Path('~/.ssh/config').expanduser()))}"
+        else:
+            ssh_args += f" -p {self.port}"
+            if self.identity:
+                ssh_args += f" -i {self.identity}"
         ssh_args += (
             " -o StrictHostKeyChecking=no -o BatchMode=yes"
             " -o ClearAllForwardings=yes"
             " -o Compression=no -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"
         )
+        if self.proxycommand:
+            ssh_args += f" -o 'ProxyCommand={self.proxycommand}'"
         return ssh_args
+
+    def probe_connection(self) -> None:
+        """Verify that this SSH route accepts a command."""
+        cmd = shlex.split(self._build_ssh_args()) + [self.ssh_target or f"{self.user}@{self.host}", "true"]
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30 if self.proxycommand else 10)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            diagnostic = self._proxy_diagnostic(stderr)
+            if diagnostic:
+                raise RuntimeError(f"{stderr}\n\nProxyCommand failed locally: {diagnostic}") from e
+            raise RuntimeError(stderr or "SSH probe failed") from e
+
+    def _proxy_diagnostic(self, stderr: str) -> str | None:
+        if not self.proxycommand:
+            return None
+        if "UNKNOWN port 65535" not in stderr and "UNKNOWN-65535" not in stderr:
+            return None
+        return diagnose_proxycommand_failure(self.proxycommand)
 
     def _ensure_remote_rsync(self) -> None:
         """Ensure rsync is installed on the remote host."""
         if getattr(self, "_rsync_checked", False):
             return
 
-        import shlex
-
         ssh_cmd = shlex.split(self._build_ssh_args())
         cmd = ssh_cmd + [
-            f"{self.user}@{self.host}",
+            self.ssh_target or f"{self.user}@{self.host}",
             "command -v rsync >/dev/null 2>&1 || "
             "(sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y rsync) || "
             "(apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y rsync)",
@@ -90,7 +133,8 @@ class FileUploader:
         self._ensure_remote_rsync()
 
         # Construct remote path
-        remote_dest = f"{self.user}@{self.host}:{self.remote_path}"
+        target = self.ssh_target or f"{self.user}@{self.host}"
+        remote_dest = f"{target}:{self.remote_path}"
         if remote_subpath:
             remote_dest += f"{remote_subpath}/"
 
@@ -132,7 +176,8 @@ class FileUploader:
         self._ensure_remote_rsync()
 
         # Use rsync for the whole folder (faster than individual files)
-        remote_dest = f"{self.user}@{self.host}:{self.remote_path}"
+        target = self.ssh_target or f"{self.user}@{self.host}"
+        remote_dest = f"{target}:{self.remote_path}"
         if remote_subpath:
             remote_dest += f"{remote_subpath}/"
 
@@ -223,23 +268,54 @@ Examples:
         ssh_config = SSHConfig()
         host_info = ssh_config.get_host_info(args.host)
 
-        hostname = host_info.get("hostname")
-        port = host_info.get("port", "22")
+        connections = resolve_ssh_connection_candidates(host_info, 2222)
         user = host_info.get("user", "user")
         identity = host_info.get("identity", "")
+        uploader: FileUploader | None = None
+        hostname = ""
+        port = "22"
+        last_error: Exception | None = None
 
-        if shutil.which("hpnssh") and hostname:
-            endpoint = resolve_vast_endpoint(hostname, 2222)
-            if endpoint:
-                mapped_host = endpoint["host"]
-                mapped_port = endpoint["port"]
-                if mapped_host != hostname or mapped_port != str(port):
-                    print(
-                        "ℹ️ Using Vast.ai mapped endpoint "
-                        f"{mapped_host}:{mapped_port} for container port 2222"
-                    )
-                hostname = mapped_host
-                port = mapped_port
+        for index, connection in enumerate(connections):
+            hostname = connection["host"]
+            port = connection["port"]
+            proxycommand = connection["proxycommand"]
+            ssh_target = connection["ssh_target"]
+
+            if connection["used_vast_endpoint"]:
+                print(
+                    "ℹ️ Using Vast.ai mapped endpoint "
+                    f"{hostname}:{port} for container port 2222"
+                )
+                if host_info.get("proxycommand"):
+                    print("ℹ️ Bypassing configured jump host for direct Vast.ai endpoint")
+            elif index > 0 and host_info.get("proxycommand"):
+                print("ℹ️ Direct Vast.ai endpoint failed; falling back to SSH config route")
+
+            candidate = FileUploader(
+                host=hostname,
+                port=str(port),
+                user=str(user),
+                identity=str(identity),
+                remote_path=args.remote_base,
+                proxycommand=proxycommand,
+                ssh_target=ssh_target,
+            )
+            try:
+                candidate.probe_connection()
+                uploader = candidate
+                break
+            except Exception as e:
+                last_error = e
+                if index + 1 < len(connections):
+                    print(f"⚠️ SSH route failed for {hostname}:{port}: {e}")
+                    continue
+                raise
+
+        if uploader is None:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("No working SSH route found")
 
         print(f"🔗 Connecting to {user}@{hostname}:{port}")
 
@@ -253,13 +329,6 @@ Examples:
         print("❌ Hostname not found in SSH config")
         sys.exit(1)
 
-    uploader = FileUploader(
-        host=hostname,
-        port=str(port),
-        user=str(user),
-        identity=str(identity),
-        remote_path=args.remote_base,
-    )
 
     # Upload
     local_path = Path(args.path)

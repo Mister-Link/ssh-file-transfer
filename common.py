@@ -7,6 +7,34 @@ from __future__ import annotations
 
 import json
 import subprocess
+import shlex
+
+
+def diagnose_proxycommand_failure(proxycommand: str | None) -> str | None:
+    """Run a local proxy command briefly to capture immediate setup failures."""
+    if not proxycommand:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["bash", "-lc", proxycommand],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=True,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or exc.stdout or "").strip()
+        return details or None
+    except FileNotFoundError:
+        return f"ProxyCommand not found: {proxycommand}"
+
+    output = (result.stderr or result.stdout or "").strip()
+    return output or None
+
+
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -55,6 +83,27 @@ class ResolvedVastEndpoint(TypedDict):
     port: str
 
 
+class ResolvedSSHConnection(TypedDict):
+    host: str
+    port: str
+    proxycommand: str | None
+    ssh_target: str | None
+    used_vast_endpoint: bool
+
+
+def _should_use_config_route(host_info: dict[str, str]) -> bool:
+    """Return True when SSH must follow the configured alias/proxy path."""
+    proxycommand = host_info.get("proxycommand", "")
+    alias = host_info.get("alias", "")
+    hostname = host_info.get("hostname", "")
+
+    if "vast-proxy.sh" in proxycommand:
+        return True
+    if proxycommand and alias and hostname == alias:
+        return True
+    return False
+
+
 class SSHConfig:
     """Parse SSH config to get connection details"""
 
@@ -81,6 +130,7 @@ class SSHConfig:
                     if current_host == host and host_config:
                         if "hostname" not in host_config:
                             host_config["hostname"] = host
+                        host_config["alias"] = host
                         return self._resolve_proxy_jump(host_config)
                     current_host = line.split()[1]
                     host_config = {}
@@ -108,6 +158,7 @@ class SSHConfig:
                 host_config["port"] = "22"
             if "hostname" not in host_config:
                 host_config["hostname"] = host
+            host_config["alias"] = host
             return self._resolve_proxy_jump(host_config)
 
         raise ValueError(f"Host '{host}' not found in SSH config")
@@ -225,3 +276,57 @@ def resolve_vast_endpoint(
         return None
 
     return {"host": host, "port": str(host_port)}
+
+
+def resolve_ssh_connection_candidates(
+    host_info: dict[str, str], container_port: int = 2222
+) -> list[ResolvedSSHConnection]:
+    """Resolve SSH routes, preferring a direct Vast.ai endpoint when appropriate."""
+    original = {
+        "host": host_info["hostname"],
+        "port": host_info.get("port", "22"),
+        "proxycommand": host_info.get("proxycommand"),
+        "ssh_target": host_info.get("alias") or host_info["hostname"],
+        "used_vast_endpoint": False,
+    }
+
+    candidates: list[ResolvedSSHConnection] = []
+    if not _should_use_config_route(host_info):
+        endpoint = resolve_vast_endpoint(original["host"], container_port)
+        if endpoint:
+            mapped = {
+                "host": endpoint["host"],
+                "port": endpoint["port"],
+                "proxycommand": None,
+                "ssh_target": None,
+                "used_vast_endpoint": True,
+            }
+            if (
+                mapped["host"] != original["host"]
+                or mapped["port"] != original["port"]
+            ):
+                candidates.append(mapped)
+
+    candidates.append(original)
+
+    unique: list[ResolvedSSHConnection] = []
+    seen: set[tuple[str, str, str | None, str | None]] = set()
+    for candidate in candidates:
+        key = (
+            candidate["host"],
+            candidate["port"],
+            candidate["proxycommand"],
+            candidate["ssh_target"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def resolve_ssh_connection(
+    host_info: dict[str, str], container_port: int = 2222
+) -> ResolvedSSHConnection:
+    """Resolve the preferred SSH route for a host."""
+    return resolve_ssh_connection_candidates(host_info, container_port)[0]
