@@ -6,6 +6,7 @@ Qt-based UI with drag-and-drop uploads and remote file browser.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shlex
@@ -20,6 +21,7 @@ from zoneinfo import ZoneInfo
 import boto3
 import boto3.s3.transfer
 import botocore.exceptions
+import qdarkstyle
 from PySide6 import QtCore, QtGui, QtWidgets
 from typing_extensions import override
 
@@ -67,6 +69,7 @@ class RemoteFileSystem:
     proxycommand: str | None
     ssh_target: str | None
     command_timeout: int
+    _os_type: str
 
     def __init__(
         self,
@@ -85,10 +88,12 @@ class RemoteFileSystem:
         self.proxycommand = self._normalize_proxycommand(proxycommand)
         self.ssh_target = ssh_target
         self.command_timeout = command_timeout
+        safe_host = (ssh_target or host).replace("/", "_").replace("@", "_")
         self.control_path = str(
-            Path(tempfile.gettempdir()) / f"uploader-ssh-{os.getpid()}"
+            Path(tempfile.gettempdir()) / f"uploader-ssh-{os.getpid()}-{safe_host}-{port}"
         )
         self.cache = {}
+        self._os_type = "unix"
 
     def _reset_ssh_control(self) -> None:
         """Reset the SSH control master connection"""
@@ -210,7 +215,104 @@ class RemoteFileSystem:
 
     def probe_connection(self) -> None:
         """Verify that this SSH route accepts a command."""
-        _ = self._run_ssh_command("true")
+        _ = self._run_ssh_command("echo 1")
+        self._os_type = self._detect_os()
+
+    def _detect_os(self) -> str:
+        """Probe the remote shell to determine OS family."""
+        try:
+            self._run_ssh_command("uname -s")
+            return "unix"
+        except Exception:
+            pass
+        try:
+            out = self._run_ssh_command("ver")
+            if "Windows" in out:
+                return "windows"
+        except Exception:
+            pass
+        return "unix"
+
+    def _run_powershell(self, script: str) -> str:
+        """Execute a PowerShell script on the remote Windows host via base64 encoding."""
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        return self._run_ssh_command(f"powershell -NoProfile -EncodedCommand {encoded}")
+
+    def _list_drives_windows(self) -> list[FileSystemItem]:
+        """Return available Windows drives as directory items."""
+        script = (
+            "[System.IO.DriveInfo]::GetDrives() | Where-Object {$_.IsReady} | ForEach-Object {\n"
+            '    Write-Output "d----- 1 - - 0 2000-01-01T00:00:00 $($_.Name)"\n'
+            "}"
+        )
+        try:
+            output = self._run_powershell(script)
+        except Exception:
+            return []
+        items: list[FileSystemItem] = []
+        for line in output.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 6)
+            if len(parts) < 7:
+                continue
+            raw_name = parts[6].strip()
+            items.append({
+                "name": raw_name, "display_name": raw_name,
+                "is_dir": True, "is_link": False, "link_target": None,
+                "perms": "d-----", "size": "0", "mtime": parts[5],
+            })
+        return items
+
+    def _list_directory_windows(self, path: str) -> list[FileSystemItem]:
+        """List directory contents on a Windows host via PowerShell."""
+        if path in ("/", "\\", ""):
+            return self._list_drives_windows()
+        safe_path = path.replace("'", "''")
+        script = (
+            f"$items = Get-ChildItem -Path '{safe_path}' -Force -ErrorAction SilentlyContinue\n"
+            "if ($items) {\n"
+            "    $sorted = $items | Sort-Object @{Expression={$_.PSIsContainer}; Descending=$true}, Name\n"
+            "    foreach ($item in $sorted) {\n"
+            "        $m = $item.Mode\n"
+            "        $l = if ($null -ne $item.Length) { $item.Length } else { 0 }\n"
+            "        $t = $item.LastWriteTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss')\n"
+            "        $n = $item.Name\n"
+            '        Write-Output "$m 1 - - $l $t $n"\n'
+            "    }\n"
+            "}"
+        )
+        try:
+            output = self._run_powershell(script)
+        except Exception:
+            return []
+        items: list[FileSystemItem] = []
+        for line in output.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 6)
+            if len(parts) < 7:
+                continue
+            perms = parts[0]
+            mtime = parts[5]
+            raw_name = parts[6].strip()
+            is_dir = perms.startswith("d")
+            is_link = len(perms) > 1 and "l" in perms[1:]
+            items.append(
+                {
+                    "name": raw_name,
+                    "display_name": raw_name,
+                    "is_dir": is_dir,
+                    "is_link": is_link,
+                    "link_target": None,
+                    "perms": perms,
+                    "size": parts[4],
+                    "mtime": mtime,
+                }
+            )
+        return items
 
     def remove_known_host(self) -> tuple[bool, str]:
         """Remove stale known_hosts entry for the current host:port."""
@@ -232,6 +334,12 @@ class RemoteFileSystem:
         """List files and directories at path"""
         if path in self.cache:
             return self.cache[path]
+
+        if self._os_type == "windows":
+            items = self._list_directory_windows(path)
+            self.cache[path] = items
+            return items
+
         command = (
             f'cd "{path}" 2>/dev/null && '
             "TZ=UTC ls -lA --time-style=+%Y-%m-%dT%H:%M:%S "
@@ -293,21 +401,42 @@ class RemoteFileSystem:
 
     def rename_path(self, old_path: str, new_path: str) -> None:
         """Rename/move a file or folder"""
-        cmd = f"mv {shlex.quote(old_path)} {shlex.quote(new_path)}"
-        self._run_ssh_command(cmd)
+        if self._os_type == "windows":
+            old_s = old_path.replace("'", "''")
+            new_s = new_path.replace("'", "''")
+            self._run_powershell(f"Move-Item -LiteralPath '{old_s}' -Destination '{new_s}' -Force")
+        else:
+            self._run_ssh_command(f"mv {shlex.quote(old_path)} {shlex.quote(new_path)}")
 
     def delete_path(self, target_path: str) -> None:
         """Delete file or folder recursively"""
-        cmd = f"rm -rf {shlex.quote(target_path)}"
-        self._run_ssh_command(cmd)
+        if self._os_type == "windows":
+            safe = target_path.replace("'", "''")
+            self._run_powershell(f"Remove-Item -LiteralPath '{safe}' -Recurse -Force")
+        else:
+            self._run_ssh_command(f"rm -rf {shlex.quote(target_path)}")
+
+    def make_dir(self, path: str) -> None:
+        """Create a directory (and any missing parents) on the remote host."""
+        if self._os_type == "windows":
+            safe = path.replace("'", "''")
+            script = f"New-Item -ItemType Directory -Path '{safe}' -Force | Out-Null"
+            self._run_powershell(script)
+        else:
+            self._run_ssh_command(f"mkdir -p {shlex.quote(path)}")
 
     def path_exists(self, target_path: str) -> bool:
         """Check if a path exists on the remote server"""
-        cmd = (
-            f"test -e {shlex.quote(target_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
-        )
         try:
-            result = self._run_ssh_command(cmd)
+            if self._os_type == "windows":
+                safe = target_path.replace("'", "''")
+                result = self._run_powershell(
+                    f"if (Test-Path -LiteralPath '{safe}') {{ Write-Output 'EXISTS' }} else {{ Write-Output 'NOT_EXISTS' }}"
+                )
+            else:
+                result = self._run_ssh_command(
+                    f"test -e {shlex.quote(target_path)} && echo 'EXISTS' || echo 'NOT_EXISTS'"
+                )
             return result.strip() == "EXISTS"
         except Exception:
             return False
@@ -318,7 +447,8 @@ class S3RemoteFileSystem:
 
     bucket: str
     prefix: str  # base prefix (always ends with "/" or is "")
-    _s3: object  # boto3 S3 client
+    _profile: str
+    _endpoint_url: str | None
     cache: dict[str, list[FileSystemItem]]
 
     def __init__(
@@ -328,11 +458,16 @@ class S3RemoteFileSystem:
         prefix: str = "",
         endpoint_url: str | None = None,
     ):
-        session = boto3.Session(profile_name=profile)
-        self._s3 = session.client("s3", endpoint_url=endpoint_url or None)
+        self._profile = profile
+        self._endpoint_url = endpoint_url or None
         self.bucket = bucket
         self.prefix = prefix.rstrip("/") + "/" if prefix else ""
         self.cache = {}
+
+    def _client(self) -> object:
+        """Create a fresh boto3 client (clients are not thread-safe)."""
+        session = boto3.Session(profile_name=self._profile)
+        return session.client("s3", endpoint_url=self._endpoint_url)
 
     def _full_key(self, path: str) -> str:
         """Convert a display path (like /models/file.txt) to an S3 key."""
@@ -356,7 +491,8 @@ class S3RemoteFileSystem:
         if prefix_key and not prefix_key.endswith("/"):
             prefix_key += "/"
 
-        paginator = self._s3.get_paginator("list_objects_v2")
+        s3 = self._client()
+        paginator = s3.get_paginator("list_objects_v2")
         items: list[FileSystemItem] = []
         seen: set[str] = set()
 
@@ -423,7 +559,8 @@ class S3RemoteFileSystem:
         new_key = self._full_key(new_path)
 
         # Check if it's a "folder" (prefix) by listing
-        paginator = self._s3.get_paginator("list_objects_v2")
+        s3 = self._client()
+        paginator = s3.get_paginator("list_objects_v2")
         keys_to_move: list[tuple[str, str]] = []
 
         for page in paginator.paginate(Bucket=self.bucket, Prefix=old_key):
@@ -437,38 +574,40 @@ class S3RemoteFileSystem:
             keys_to_move = [(old_key, new_key)]
 
         for src, dst in keys_to_move:
-            self._s3.copy_object(
+            s3.copy_object(
                 Bucket=self.bucket,
                 CopySource={"Bucket": self.bucket, "Key": src},
                 Key=dst,
             )
-            self._s3.delete_object(Bucket=self.bucket, Key=src)
+            s3.delete_object(Bucket=self.bucket, Key=src)
 
     def delete_path(self, target_path: str) -> None:
         key = self._full_key(target_path)
-        paginator = self._s3.get_paginator("list_objects_v2")
+        s3 = self._client()
+        paginator = s3.get_paginator("list_objects_v2")
         deleted_any = False
 
         for page in paginator.paginate(Bucket=self.bucket, Prefix=key):
             objects = [{"Key": obj["Key"]} for obj in (page.get("Contents") or [])]
             if objects:
-                self._s3.delete_objects(Bucket=self.bucket, Delete={"Objects": objects})
+                s3.delete_objects(Bucket=self.bucket, Delete={"Objects": objects})
                 deleted_any = True
 
         # Also try deleting an exact key if nothing was found under the prefix
         if not deleted_any:
-            self._s3.delete_object(Bucket=self.bucket, Key=key)
+            s3.delete_object(Bucket=self.bucket, Key=key)
 
     def path_exists(self, target_path: str) -> bool:
         key = self._full_key(target_path)
+        s3 = self._client()
         # Check as exact file
         try:
-            self._s3.head_object(Bucket=self.bucket, Key=key)
+            s3.head_object(Bucket=self.bucket, Key=key)
             return True
         except botocore.exceptions.ClientError:
             pass
         # Check as directory prefix
-        resp = self._s3.list_objects_v2(Bucket=self.bucket, Prefix=key + "/", MaxKeys=1)
+        resp = s3.list_objects_v2(Bucket=self.bucket, Prefix=key + "/", MaxKeys=1)
         return bool(resp.get("Contents") or resp.get("CommonPrefixes"))
 
 
@@ -801,6 +940,7 @@ class FileUploader:
     identity: str
     proxycommand: str | None
     ssh_target: str | None
+    os_type: str
 
     def __init__(
         self,
@@ -810,6 +950,7 @@ class FileUploader:
         identity: str,
         proxycommand: str | None = None,
         ssh_target: str | None = None,
+        os_type: str = "unix",
     ):
         self.host = host
         self.port = port
@@ -817,6 +958,7 @@ class FileUploader:
         self.identity = identity
         self.proxycommand = self._normalize_proxycommand(proxycommand)
         self.ssh_target = ssh_target
+        self.os_type = os_type
 
     def _normalize_proxycommand(self, proxycommand: str | None) -> str | None:
         if not proxycommand:
@@ -886,6 +1028,81 @@ class FileUploader:
                     False, f"Warning: Remote rsync setup failed: {err_msg.strip()}"
                 )
 
+    def _build_scp_cmd(self) -> list[str]:
+        """Build base scp command with connection options for Windows hosts."""
+        cmd = ["scp", "-q", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes"]
+        if self.ssh_target:
+            cmd += ["-F", str(Path("~/.ssh/config").expanduser())]
+        else:
+            cmd += ["-P", self.port]
+            if self.identity:
+                cmd += ["-i", self.identity]
+            if self.proxycommand:
+                cmd += ["-o", f"ProxyCommand={self.proxycommand}"]
+        return cmd
+
+    def _upload_scp(
+        self,
+        local_path: str,
+        remote_path: str,
+        progress_callback: Callable[[bool | None, str], None] | None = None,
+        custom_name: str | None = None,
+    ) -> bool:
+        local = Path(local_path)
+        display_name = custom_name or local.name
+        item_type = "folder" if local.is_dir() else "file"
+        remote_base = remote_path.rstrip("/")
+        dest_path = f"{remote_base}/{display_name}"
+        target = self.ssh_target or f"{self.user}@{self.host}"
+
+        cmd = self._build_scp_cmd()
+        if local.is_dir():
+            cmd.append("-r")
+        cmd += [str(local), f"{target}:{remote_base}/{display_name}"]
+
+        try:
+            if progress_callback:
+                progress_callback(None, f"Uploading {item_type} '{display_name}' to {remote_base}/")
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            if progress_callback:
+                progress_callback(True, f"✅ {item_type.capitalize()} '{display_name}' written to {dest_path}")
+            return True
+        except subprocess.CalledProcessError as e:
+            err = e.stderr or str(e)
+            if progress_callback:
+                progress_callback(False, f"❌ Failed to upload {item_type} '{display_name}': {err}")
+            return False
+
+    def _download_scp(
+        self,
+        remote_path: str,
+        local_dest: str,
+        is_dir: bool,
+        progress_callback: Callable[[bool | None, str], None] | None = None,
+    ) -> bool:
+        local_dest_path = Path(local_dest)
+        local_dest_path.parent.mkdir(parents=True, exist_ok=True)
+        target = self.ssh_target or f"{self.user}@{self.host}"
+        name = Path(remote_path).name
+
+        cmd = self._build_scp_cmd()
+        if is_dir:
+            cmd.append("-r")
+        cmd += [f"{target}:{remote_path}", str(local_dest_path)]
+
+        try:
+            if progress_callback:
+                progress_callback(None, f"Downloading {name}...")
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            if progress_callback:
+                progress_callback(True, f"✅ Downloaded {name}")
+            return True
+        except subprocess.CalledProcessError as e:
+            err = e.stderr or ""
+            if progress_callback:
+                progress_callback(False, f"❌ Download failed: {err}")
+            return False
+
     def upload(
         self,
         local_path: str,
@@ -908,6 +1125,9 @@ class FileUploader:
             if progress_callback:
                 progress_callback(False, f"Not found: {local_path_obj}")
             return False
+
+        if self.os_type == "windows":
+            return self._upload_scp(local_path, remote_path, progress_callback, custom_name)
 
         self._ensure_remote_rsync(progress_callback)
 
@@ -982,6 +1202,9 @@ class FileUploader:
         progress_callback: Callable[[bool | None, str], None] | None = None,
     ) -> bool:
         """Download file or folder from remote"""
+        if self.os_type == "windows":
+            return self._download_scp(remote_path, local_dest, is_dir, progress_callback)
+
         local_dest_path = Path(local_dest)
         local_dest_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1214,14 +1437,16 @@ def format_mtime(iso_str: str) -> str:
 
 TypeRole = QtCore.Qt.ItemDataRole.UserRole + 1
 PathRole = QtCore.Qt.ItemDataRole.UserRole + 2
+SortRole = QtCore.Qt.ItemDataRole.UserRole + 3
 
 
 class RemoteTreeView(QtWidgets.QTreeView):
     dropRequested: QtCore.Signal = QtCore.Signal(list, str)
     renameRequested: QtCore.Signal = QtCore.Signal(str, str)
-    deleteRequested: QtCore.Signal = QtCore.Signal(str)
-    downloadRequested: QtCore.Signal = QtCore.Signal(str, bool)
+    deleteRequested: QtCore.Signal = QtCore.Signal(list)
+    downloadRequested: QtCore.Signal = QtCore.Signal(list)
     bookmarkRequested: QtCore.Signal = QtCore.Signal(str)
+    newFolderRequested: QtCore.Signal = QtCore.Signal(str)
     current_path: str
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
@@ -1230,7 +1455,7 @@ class RemoteTreeView(QtWidgets.QTreeView):
         self.setAcceptDrops(True)
         self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DropOnly)
         self.setDefaultDropAction(QtCore.Qt.DropAction.CopyAction)
-        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setUniformRowHeights(True)
         self.setAlternatingRowColors(True)
@@ -1239,6 +1464,19 @@ class RemoteTreeView(QtWidgets.QTreeView):
 
     def set_current_path(self, path: str) -> None:
         self.current_path = path
+
+    @override
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in (QtCore.Qt.Key.Key_Delete, QtCore.Qt.Key.Key_Backspace):
+            paths = [
+                str(Path(self.current_path) / (i.data(PathRole) or i.data(QtCore.Qt.ItemDataRole.DisplayRole)))
+                for i in self.selectedIndexes()
+                if i.column() == 0 and i.data(TypeRole) != "parent"
+            ]
+            if paths:
+                self.deleteRequested.emit(paths)
+        else:
+            super().keyPressEvent(event)
 
     @override
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
@@ -1287,31 +1525,62 @@ class RemoteTreeView(QtWidgets.QTreeView):
 
     def open_context_menu(self, pos: QtCore.QPoint) -> None:
         idx = self.indexAt(pos)
-        if not idx.isValid():
-            return
-        item_type = idx.data(TypeRole)
-        name = idx.data(PathRole) or idx.data(QtCore.Qt.ItemDataRole.DisplayRole)
-        if item_type == "parent":
+        menu = QtWidgets.QMenu(self)
+
+        if not idx.isValid() or idx.data(TypeRole) == "parent":
+            new_folder_action = menu.addAction("New Folder")
+            action = menu.exec(self.viewport().mapToGlobal(pos))
+            if action == new_folder_action:
+                self.newFolderRequested.emit(self.current_path)
             return
 
-        menu = QtWidgets.QMenu(self)
+        # Ensure the right-clicked row is selected (without wiping multi-selection
+        # unless the user clicked outside the current selection).
+        if idx not in self.selectedIndexes():
+            self.setCurrentIndex(idx)
+
+        item_type = idx.data(TypeRole)
+        name = idx.data(PathRole) or idx.data(QtCore.Qt.ItemDataRole.DisplayRole)
+
+        # Collect all selected non-parent rows (column 0 only to avoid duplicates).
+        selected_paths = [
+            str(Path(self.current_path) / (i.data(PathRole) or i.data(QtCore.Qt.ItemDataRole.DisplayRole)))
+            for i in self.selectedIndexes()
+            if i.column() == 0 and i.data(TypeRole) != "parent"
+        ]
+        multi = len(selected_paths) > 1
+
         download_action = menu.addAction("Download")
         bookmark_action = None
-        if item_type in ("folder", "link"):
+        if not multi and item_type in ("folder", "link"):
             bookmark_action = menu.addAction("Add bookmark")
-        rename_action = menu.addAction("Rename")
-        delete_action = menu.addAction("Delete")
+        copy_path_action = menu.addAction("Copy path") if not multi else None
+        rename_action = menu.addAction("Rename") if not multi else None
+        delete_label = f"Delete ({len(selected_paths)} items)" if multi else "Delete"
+        delete_action = menu.addAction(delete_label)
+        menu.addSeparator()
+        new_folder_action = menu.addAction("New Folder")
         action = menu.exec(self.viewport().mapToGlobal(pos))
 
         full_path = str(Path(self.current_path) / name)
         if action == download_action:
-            self.downloadRequested.emit(full_path, item_type in ("folder", "link"))
+            selected_items = [
+                (str(Path(self.current_path) / (i.data(PathRole) or i.data(QtCore.Qt.ItemDataRole.DisplayRole))),
+                 i.data(TypeRole) in ("folder", "link"))
+                for i in self.selectedIndexes()
+                if i.column() == 0 and i.data(TypeRole) != "parent"
+            ] or [(full_path, item_type in ("folder", "link"))]
+            self.downloadRequested.emit(selected_items)
         elif bookmark_action and action == bookmark_action:
             self.bookmarkRequested.emit(full_path)
-        elif action == rename_action:
+        elif copy_path_action and action == copy_path_action:
+            QtWidgets.QApplication.clipboard().setText(full_path)
+        elif rename_action and action == rename_action:
             self.renameRequested.emit(full_path, name)
         elif action == delete_action:
-            self.deleteRequested.emit(full_path)
+            self.deleteRequested.emit(selected_paths)
+        elif action == new_folder_action:
+            self.newFolderRequested.emit(self.current_path)
 
 
 class FolderTreeView(QtWidgets.QTreeView):
@@ -1319,8 +1588,9 @@ class FolderTreeView(QtWidgets.QTreeView):
     dropRequested: QtCore.Signal = QtCore.Signal(list, str)
     renameRequested: QtCore.Signal = QtCore.Signal(str, str)
     deleteRequested: QtCore.Signal = QtCore.Signal(str)
-    downloadRequested: QtCore.Signal = QtCore.Signal(str, bool)
+    downloadRequested: QtCore.Signal = QtCore.Signal(list)
     bookmarkRequested: QtCore.Signal = QtCore.Signal(str)
+    newFolderRequested: QtCore.Signal = QtCore.Signal(str)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1386,16 +1656,20 @@ class FolderTreeView(QtWidgets.QTreeView):
         bookmark_action = menu.addAction("Add bookmark")
         rename_action = menu.addAction("Rename")
         delete_action = menu.addAction("Delete")
+        menu.addSeparator()
+        new_folder_action = menu.addAction("New Folder")
         action = menu.exec(self.viewport().mapToGlobal(pos))
         name = Path(path).name or path
         if action == download_action:
-            self.downloadRequested.emit(path, True)
+            self.downloadRequested.emit([(path, True)])
         elif action == bookmark_action:
             self.bookmarkRequested.emit(path)
         elif action == rename_action:
             self.renameRequested.emit(path, name)
         elif action == delete_action:
             self.deleteRequested.emit(path)
+        elif action == new_folder_action:
+            self.newFolderRequested.emit(path)
 
 
 class BookmarkList(QtWidgets.QListWidget):
@@ -1424,12 +1698,12 @@ class BookmarkList(QtWidgets.QListWidget):
                 background: #0f1626;
                 border: 1px solid #1f2937;
                 border-radius: 8px;
-                padding: 6px;
+                padding: 2px;
             }
             QListWidget::item {
-                padding: 5px 8px;
-                margin: 1px 0;
-                border-radius: 6px;
+                padding: 2px 6px;
+                margin: 0;
+                border-radius: 4px;
                 color: #e6edf3;
             }
             QListWidget::item:hover {
@@ -1532,13 +1806,14 @@ class UploaderWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SSH File Transfer")
-        self.resize(1100, 750)
+        self.resize(675, 750)
 
         self.host_info = None
         self.remote_fs = None
         self.uploader = None
         self._is_s3 = False
         self.current_remote_path = "/"
+        self._list_generation = 0
         self.workers = []
         self._upload_queue: list[S3UploadWorker] = []
         self._active_s3_uploads = 0
@@ -1664,8 +1939,8 @@ class UploaderWindow(QtWidgets.QMainWindow):
                 remote_fs = RemoteFileSystem(
                     host=resolved_host,
                     port=resolved_port,
-                    user=self.host_info["user"],
-                    identity=self.host_info["identity"],
+                    user=self.host_info.get("user", ""),
+                    identity=self.host_info.get("identity", ""),
                     proxycommand=proxycommand,
                     ssh_target=ssh_target,
                     command_timeout=command_timeout,
@@ -1673,8 +1948,8 @@ class UploaderWindow(QtWidgets.QMainWindow):
                 uploader = FileUploader(
                     host=resolved_host,
                     port=resolved_port,
-                    user=self.host_info["user"],
-                    identity=self.host_info["identity"],
+                    user=self.host_info.get("user", ""),
+                    identity=self.host_info.get("identity", ""),
                     proxycommand=proxycommand,
                     ssh_target=ssh_target,
                 )
@@ -1694,6 +1969,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
                         continue
                     raise
 
+                uploader.os_type = remote_fs._os_type
                 self.remote_fs = remote_fs
                 self.uploader = uploader
                 break
@@ -1706,6 +1982,8 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self.log_box.appendPlainText(
                 f"Connected to {host} ({self.remote_fs.host}:{self.remote_fs.port})"
             )
+            self.current_remote_path = "/"
+            self.path_edit.setText("/")
             self._initialize_folder_view()
             self.refresh_remote_view()
             self._update_bookmark_list()
@@ -1723,10 +2001,10 @@ class UploaderWindow(QtWidgets.QMainWindow):
             all_hosts = hosts + s3_hosts
             self.host_combo.addItems(all_hosts)
             if all_hosts:
-                # Try to select vast-ai by default, otherwise use first host
+                # Try to select "ai" by default, otherwise use first host
                 try:
-                    vast_index = all_hosts.index("vast-ai")
-                    self.host_combo.setCurrentIndex(vast_index)
+                    ai_index = all_hosts.index("ai")
+                    self.host_combo.setCurrentIndex(ai_index)
                 except ValueError:
                     self.host_combo.setCurrentIndex(0)
                 self.connect_to_host()
@@ -1741,7 +2019,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.folder_tree.setRootIndex(QtCore.QModelIndex())  # Reset root index
         self.expanded_folders.clear()
 
-        if not self.host_info or not self.remote_fs:
+        if not self.remote_fs or (not self._is_s3 and not self.host_info):
             return
 
         root_path = "/"
@@ -1779,8 +2057,10 @@ class UploaderWindow(QtWidgets.QMainWindow):
         else:
             worker = RemoteListWorker(self.remote_fs, path)  # type: ignore[arg-type]
 
+        gen = self._list_generation
+
         def on_complete(p: str, items: list[FileSystemItem]) -> None:
-            if p != path:
+            if p != path or self._list_generation != gen:
                 return
 
             icon_provider = QtWidgets.QFileIconProvider()
@@ -1791,7 +2071,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
 
             for file_item in items:
                 name = file_item["name"]
-                full_path = str(Path(p) / name)
+                full_path = self._remote_join(p, name)
 
                 is_folder_like = file_item["is_dir"] or file_item["is_link"]
                 icon = folder_icon if is_folder_like else file_icon
@@ -1914,6 +2194,27 @@ class UploaderWindow(QtWidgets.QMainWindow):
                     dummy_item = QtGui.QStandardItem()
                     dummy_item.setEditable(False)
                     item.appendRow(dummy_item)
+
+    def _paste_clipboard_image(self) -> None:
+        if not self.uploader or not self.remote_fs:
+            self.log_box.appendPlainText("Not connected to a host.")
+            return
+
+        clipboard = QtWidgets.QApplication.clipboard()
+        image = clipboard.image()
+        if image.isNull():
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"clipboard_{timestamp}.png"
+        tmp_path = str(Path(tempfile.gettempdir()) / filename)
+
+        if not image.save(tmp_path, "PNG"):
+            self.log_box.appendPlainText(f"Failed to save clipboard image to {tmp_path}")
+            return
+
+        self.log_box.appendPlainText(f"Pasting clipboard image as '{filename}'...")
+        self.handle_drop([tmp_path], self.current_remote_path)
 
     def handle_drop(self, local_paths: list[str], remote_path: str) -> None:
         """Handle drag and drop operation"""
@@ -2055,25 +2356,53 @@ class UploaderWindow(QtWidgets.QMainWindow):
         if not self.remote_fs:
             return
 
-        parent_path = Path(path).parent
-        new_path = str(parent_path / new_name)
+        parent_path = self._remote_parent(path)
+        new_path = self._remote_join(parent_path, new_name)
 
         try:
             self.remote_fs.rename_path(path, new_path)
             self.log_box.appendPlainText(f"Renamed: {path} -> {new_path}")
             # Refresh parent directory
-            if str(parent_path) == self.current_remote_path:
+            if parent_path == self.current_remote_path:
                 self.refresh_remote_view(force=True)
             else:
                 self.remote_fs.clear_cache(str(parent_path))
         except Exception as e:
             self.log_box.appendPlainText(f"Error renaming {path}: {e}")
 
+    def handle_new_folder(self, parent_path: str) -> None:
+        """Handle new folder request"""
+        name, ok = QtWidgets.QInputDialog.getText(self, "New Folder", "Folder name:")
+        if not ok or not name.strip():
+            return
+        if not self.remote_fs:
+            return
+        new_path = self._remote_join(parent_path, name.strip())
+        try:
+            self.remote_fs.make_dir(new_path)
+            self.log_box.appendPlainText(f"Created folder: {new_path}")
+            self.remote_fs.clear_cache(parent_path)
+            if parent_path == self.current_remote_path:
+                self.refresh_remote_view(force=True)
+            self._refresh_expanded_folder(parent_path)
+        except Exception as e:
+            self.log_box.appendPlainText(f"Error creating folder: {e}")
+
     def handle_delete(self, path: str) -> None:
-        """Handle delete request"""
+        """Handle single-path delete (used by FolderTreeView)."""
+        self.handle_delete_multiple([path])
+
+    def handle_delete_multiple(self, paths: list[str]) -> None:
+        """Handle delete request for one or more paths."""
+        if not paths:
+            return
         msg_box = QtWidgets.QMessageBox(self)
         msg_box.setWindowTitle("Confirm Delete")
-        msg_box.setText(f"Are you sure you want to delete <strong>{path}</strong>?")
+        if len(paths) == 1:
+            msg_box.setText(f"Are you sure you want to delete <strong>{paths[0]}</strong>?")
+        else:
+            names = "".join(f"<li>{p}</li>" for p in paths)
+            msg_box.setText(f"Are you sure you want to delete these <strong>{len(paths)} items</strong>?<ul>{names}</ul>")
         msg_box.setStandardButtons(
             QtWidgets.QMessageBox.StandardButton.Yes
             | QtWidgets.QMessageBox.StandardButton.No
@@ -2087,45 +2416,58 @@ class UploaderWindow(QtWidgets.QMainWindow):
         if not self.remote_fs:
             return
 
-        try:
-            self.remote_fs.delete_path(path)
-            self.log_box.appendPlainText(f"Deleted: {path}")
-            # Refresh parent directory
-            parent_path = str(Path(path).parent)
+        refresh_needed: set[str] = set()
+        for path in paths:
+            try:
+                self.remote_fs.delete_path(path)
+                self.log_box.appendPlainText(f"Deleted: {path}")
+                refresh_needed.add(self._remote_parent(path))
+            except Exception as e:
+                self.log_box.appendPlainText(f"Error deleting {path}: {e}")
+
+        for parent_path in refresh_needed:
             if parent_path == self.current_remote_path:
                 self.refresh_remote_view(force=True)
             else:
                 self.remote_fs.clear_cache(parent_path)
-        except Exception as e:
-            self.log_box.appendPlainText(f"Error deleting {path}: {e}")
 
-    def handle_download(self, path: str, is_dir: bool) -> None:
-        """Handle download request"""
-        if not self.uploader:
+    def handle_download(self, items: list[tuple[str, bool]]) -> None:
+        """Handle download request for one or more remote items."""
+        if not self.uploader or not items:
             return
 
         downloads_path = Path.home() / "Downloads"
         downloads_path.mkdir(exist_ok=True)
-        dest_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Download to...", str(downloads_path / Path(path).name)
-        )
-        if not dest_path:
-            return
 
-        if self._is_s3:
-            worker: QtCore.QThread = S3DownloadWorker(
-                self.uploader, path, dest_path, is_dir
-            )  # type: ignore[arg-type]
-        else:
-            worker = DownloadWorker(self.uploader, path, dest_path, is_dir)  # type: ignore[arg-type]
-        worker.progress.connect(self.log_box.appendPlainText)
-        worker.finished_.connect(
-            lambda success: self.log_box.appendPlainText(
-                "Download finished." if success else "Download failed."
+        for remote_path, is_dir in items:
+            name = Path(remote_path).name
+            local_dest = downloads_path / name
+
+            if local_dest.exists():
+                msg = QtWidgets.QMessageBox(self)
+                msg.setWindowTitle("Download Conflict")
+                msg.setText(f"<b>{name}</b> already exists in Downloads.")
+                overwrite_btn = msg.addButton("Overwrite", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+                msg.addButton("Skip", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+                if msg.clickedButton() != overwrite_btn:
+                    self.log_box.appendPlainText(f"⏭ Skipped: {name}")
+                    continue
+
+            if self._is_s3:
+                worker: QtCore.QThread = S3DownloadWorker(
+                    self.uploader, remote_path, str(local_dest), is_dir  # type: ignore[arg-type]
+                )
+            else:
+                worker = DownloadWorker(self.uploader, remote_path, str(local_dest), is_dir)  # type: ignore[arg-type]
+            worker.progress.connect(self.log_box.appendPlainText)
+            worker.finished_.connect(
+                lambda success, n=name: self.log_box.appendPlainText(
+                    f"✅ Downloaded '{n}'." if success else f"❌ Download failed: '{n}'."
+                )
             )
-        )
-        self.workers.append(worker)
-        worker.start()
+            self.workers.append(worker)
+            worker.start()
 
     def add_bookmark(self, path: str) -> None:
         host = self.host_combo.currentText()
@@ -2162,7 +2504,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
 
     def _sync_folder_view(self, path_to_sync: str) -> None:
         """Expand the folder view to the specified path."""
-        if not path_to_sync or path_to_sync == "/":
+        if not path_to_sync or path_to_sync == "/" or self._is_windows_remote():
             return
 
         parts = Path(path_to_sync).parts
@@ -2191,9 +2533,39 @@ class UploaderWindow(QtWidgets.QMainWindow):
                 # This can happen if the directory is not yet loaded.
                 break
 
+    def _is_windows_remote(self) -> bool:
+        if self._is_s3 or not self.remote_fs:
+            return False
+        return bool(self.remote_fs._os_type == "windows")
+
+    def _remote_join(self, base: str, name: str) -> str:
+        """Join a remote path with a child name, respecting the remote OS."""
+        if self._is_windows_remote():
+            if base in ("/", "\\", ""):
+                return name  # drive letter (e.g. "C:\") is already absolute
+            return base.rstrip("\\/") + "\\" + name
+        return str(Path(base) / name)
+
+    def _remote_parent(self, path: str) -> str:
+        """Return the parent of a remote path, respecting the remote OS."""
+        if self._is_windows_remote():
+            p = path.rstrip("\\/")
+            # Already at a drive root like "C:" or "C:\" → virtual root
+            if len(p) <= 2 and p[1:2] == ":":
+                return "/"
+            idx = max(p.rfind("\\"), p.rfind("/"))
+            if idx < 0:
+                return "/"
+            parent = p[:idx]
+            # "C:\foo" → idx=2 → parent "C:" → restore trailing backslash
+            if len(parent) == 2 and parent[1] == ":":
+                parent += "\\"
+            return parent or "/"
+        return str(Path(path).parent)
+
     def go_up_directory(self) -> None:
         """Go up to the parent directory"""
-        new_path = str(Path(self.current_remote_path).parent)
+        new_path = self._remote_parent(self.current_remote_path)
         if new_path != self.current_remote_path:
             self.current_remote_path = new_path
             self.path_edit.setText(self.current_remote_path)
@@ -2215,7 +2587,10 @@ class UploaderWindow(QtWidgets.QMainWindow):
             )  # type: ignore[arg-type]
         else:
             worker = RemoteListWorker(self.remote_fs, self.current_remote_path)  # type: ignore[arg-type]
-        worker.completed.connect(self._on_list_completed)
+        gen = self._list_generation
+        worker.completed.connect(
+            lambda path, items: self._on_list_completed(path, items) if self._list_generation == gen else None
+        )
         worker.failed.connect(self._on_list_failed)
         self.workers.append(worker)
         worker.start()
@@ -2229,43 +2604,44 @@ class UploaderWindow(QtWidgets.QMainWindow):
         # Disable sorting temporarily to ensure ".." stays first
         self.tree.setSortingEnabled(False)
 
-        if Path(path).parent != Path(path):
+        if self._remote_parent(path) != path:
             parent_item = QtGui.QStandardItem("..")
             parent_item.setData("parent", TypeRole)
-            # Make the ".." item not sortable by prefixing with a character that sorts first
             parent_item.setData(" ..", QtCore.Qt.ItemDataRole.DisplayRole)
-            self.model.appendRow(
-                [parent_item, QtGui.QStandardItem(""), QtGui.QStandardItem("")]
-            )
+            parent_item.setData("\x00", SortRole)  # sorts before everything
+            parent_mtime = QtGui.QStandardItem("")
+            parent_mtime.setData("\x00", SortRole)
+            parent_size = QtGui.QStandardItem("")
+            parent_size.setData("\x00", SortRole)
+            self.model.appendRow([parent_item, parent_mtime, parent_size])
 
         for item in items:
             try:
                 name_item = QtGui.QStandardItem(item["display_name"])
                 name_item.setData(item["name"], PathRole)
-                name_item.setData(
-                    "folder"
-                    if item["is_dir"]
-                    else "link"
-                    if item["is_link"]
-                    else "file",
-                    TypeRole,
-                )
+                is_folder_like = item["is_dir"] or item["is_link"]
+                item_type = "folder" if item["is_dir"] else "link" if item["is_link"] else "file"
+                name_item.setData(item_type, TypeRole)
+                sort_prefix = "0_" if is_folder_like else "1_"
+                name_item.setData(sort_prefix + item["display_name"].lower(), SortRole)
                 name_item.setToolTip(item["display_name"])
 
                 icon_provider = QtWidgets.QFileIconProvider()
                 icon = (
                     icon_provider.icon(QtWidgets.QFileIconProvider.IconType.Folder)
-                    if item["is_dir"]
-                    else self.style().standardIcon(
-                        QtWidgets.QStyle.StandardPixmap.SP_FileLinkIcon
-                    )
-                    if item["is_link"]
+                    if item["is_dir"] or item["is_link"]
                     else icon_provider.icon(QtWidgets.QFileIconProvider.IconType.File)
                 )
                 name_item.setIcon(icon)
 
                 mtime_item = QtGui.QStandardItem(format_mtime(item["mtime"]))
+                mtime_item.setData(item["mtime"], SortRole)
+
                 size_item = QtGui.QStandardItem(human_size(item["size"]))
+                try:
+                    size_item.setData(f"{int(item['size']):020d}", SortRole)
+                except (ValueError, TypeError):
+                    size_item.setData("", SortRole)
 
                 self.model.appendRow([name_item, mtime_item, size_item])
             except Exception as e:
@@ -2273,7 +2649,8 @@ class UploaderWindow(QtWidgets.QMainWindow):
                     f"Error processing item {item.get('name', '')}: {e}"
                 )
 
-        # Re-enable sorting - the ".." will stay first due to the space prefix
+        # Re-enable sorting; ".." stays first via its \x00 SortRole key.
+        # Folders/links (0_ prefix) sort before files (1_ prefix).
         self.tree.setSortingEnabled(True)
         self.tree.sortByColumn(0, QtCore.Qt.SortOrder.AscendingOrder)
 
@@ -2355,6 +2732,9 @@ class UploaderWindow(QtWidgets.QMainWindow):
         """Handle host change"""
         if self._initializing_hosts:
             return
+        self.stop_workers()
+        self._list_generation += 1
+        self.current_remote_path = ""
         self.model.removeRows(0, self.model.rowCount())
         self.folder_model.removeRows(0, self.folder_model.rowCount())
         self.log_box.clear()
@@ -2371,7 +2751,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
                 name = index.data(PathRole) or index.data(
                     QtCore.Qt.ItemDataRole.DisplayRole
                 )
-                new_path = str(Path(self.current_remote_path) / name)
+                new_path = self._remote_join(self.current_remote_path, name)
                 self.current_remote_path = new_path
                 self.path_edit.setText(self.current_remote_path)
                 self.refresh_remote_view()
@@ -2382,32 +2762,15 @@ class UploaderWindow(QtWidgets.QMainWindow):
             self.log_box.appendPlainText(f"Error navigating: {e}")
 
     def _build_palette(self) -> None:
-        palette = QtGui.QPalette()
-        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#0d1017"))
-        palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#0f1626"))
-        palette.setColor(
-            QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#121826")
-        )
-        palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#e6edf3"))
-        palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#23c4b8"))
-        palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#0b111b"))
-        palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#1b2434"))
-        palette.setColor(
-            QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#e6edf3")
-        )
-        self.setPalette(palette)
-
+        # qdarkstyle is the base; these rules layer our teal accent on top.
         self.setStyleSheet(
-            """
-            QWidget { color: #e6edf3; background: #0d1017; font-family: \"Segoe UI\", \"Helvetica Neue\", sans-serif; font-size: 10pt; }
-            QLineEdit, QPlainTextEdit { background: #0f1626; border: 1px solid #1f2937; border-radius: 6px; padding: 8px; selection-background-color: #1b2434; }
-            QTreeView { background: #0f1626; border: 1px solid #1f2937; border-radius: 6px; alternate-background-color: #121826; selection-background-color: #1b2434; }
-            QHeaderView::section { background: #0f1626; color: #9fb3c8; border: 0; padding: 6px 8px; }
+            QtWidgets.QApplication.instance().styleSheet()  # type: ignore[union-attr]
+            + """
             QPushButton { border-radius: 6px; padding: 10px 14px; font-weight: 600; }
             QPushButton#accent { background: #23c4b8; color: #0b111b; border: 0; }
-            QPushButton#ghost { background: #0f1626; color: #e6edf3; border: 1px solid #1f2937; }
+            QPushButton#accent:hover { background: #1eada3; }
+            QPushButton#ghost { border: 1px solid #3d4450; }
             QLabel#muted { color: #9fb3c8; }
-            QStatusBar { background: #0f1626; border: 0; color: #9fb3c8; }
             """
         )
 
@@ -2440,8 +2803,8 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.folder_tree.deleteRequested.connect(self.handle_delete)
         self.folder_tree.downloadRequested.connect(self.handle_download)
         self.folder_tree.bookmarkRequested.connect(self.add_bookmark)
+        self.folder_tree.newFolderRequested.connect(self.handle_new_folder)
         folder_layout.addWidget(self.folder_tree)
-        sidebar_splitter.addWidget(folder_widget)
 
         # Bookmarks widget
         bookmarks_widget = QtWidgets.QWidget()
@@ -2459,15 +2822,16 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.bookmark_list.dropRequested.connect(self.handle_drop)
         self.bookmark_list.removeRequested.connect(self.remove_bookmark)
         bookmarks_layout.addWidget(self.bookmark_list)
-        sidebar_splitter.addWidget(bookmarks_widget)
 
-        # Set initial sizes: calculate bookmark height based on minimal or 250px
-        total_height = self.height() or 750  # Use default if not set yet
-        bookmark_height = max(
-            250, int(total_height * 0.15)
-        )  # At least 250px or 15% of height
+        # Bookmarks above, folder tree below
+        sidebar_splitter.addWidget(bookmarks_widget)
+        sidebar_splitter.addWidget(folder_widget)
+
+        # Set initial sizes: bookmarks get a fixed slice, folder tree gets the rest
+        total_height = self.height() or 750
+        bookmark_height = max(250, int(total_height * 0.15))
         folder_height = total_height - bookmark_height
-        sidebar_splitter.setSizes([folder_height, bookmark_height])
+        sidebar_splitter.setSizes([bookmark_height, folder_height])
 
         splitter.addWidget(sidebar_splitter)
         splitter.setStretchFactor(0, 0)
@@ -2512,6 +2876,7 @@ class UploaderWindow(QtWidgets.QMainWindow):
 
         self.model = QtGui.QStandardItemModel(0, 3)
         self.model.setHorizontalHeaderLabels(["Name", "Modified", "Size"])
+        self.model.setSortRole(SortRole)
 
         self.tree = RemoteTreeView()
         self.tree.setModel(self.model)
@@ -2520,22 +2885,24 @@ class UploaderWindow(QtWidgets.QMainWindow):
         self.tree.sortByColumn(0, QtCore.Qt.SortOrder.AscendingOrder)
         header = self.tree.header()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(
-            1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
-        )
-        header.setSectionResizeMode(
-            2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
-        )
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Interactive)
         self.tree.doubleClicked.connect(self.on_tree_double_click)
         self.tree.dropRequested.connect(self.handle_drop)
         self.tree.renameRequested.connect(self.handle_rename)
-        self.tree.deleteRequested.connect(self.handle_delete)
+        self.tree.deleteRequested.connect(self.handle_delete_multiple)
         self.tree.downloadRequested.connect(self.handle_download)
         self.tree.bookmarkRequested.connect(self.add_bookmark)
-        self.tree.setColumnWidth(0, 600)
-        self.tree.setColumnWidth(1, 170)
-        self.tree.setColumnWidth(2, 110)
+        self.tree.newFolderRequested.connect(self.handle_new_folder)
+
+        def _set_initial_column_widths() -> None:
+            col1, col2 = 170, 80
+            self.tree.setColumnWidth(1, col1)
+            self.tree.setColumnWidth(2, col2)
+            self.tree.setColumnWidth(0, max(100, self.tree.viewport().width() - col1 - col2))
+
+        QtCore.QTimer.singleShot(0, _set_initial_column_widths)
         main_layout.addWidget(self.tree)
 
         self.log_box = QtWidgets.QPlainTextEdit()
@@ -2550,6 +2917,10 @@ class UploaderWindow(QtWidgets.QMainWindow):
 
         layout.addWidget(splitter, 1)
 
+        paste_shortcut = QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Paste, self)
+        paste_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        paste_shortcut.activated.connect(self._paste_clipboard_image)
+
         self.setCentralWidget(central)
         self.statusBar().hide()
 
@@ -2558,6 +2929,7 @@ if __name__ == "__main__":
     import sys
 
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
     window = UploaderWindow()
     window.show()
     sys.exit(app.exec())
