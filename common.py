@@ -290,6 +290,11 @@ def resolve_ssh_connection_candidates(
         "used_vast_endpoint": False,
     }
 
+    if host_info.get("alias") in {"vast", "vast-ai"}:
+        # Use the configured `ssh vast` route exactly. Vast.ai can report a
+        # private or stale forwarded address that is not reachable locally.
+        return [original]
+
     candidates: list[ResolvedSSHConnection] = []
     if not _should_use_config_route(host_info):
         endpoint = resolve_vast_endpoint(original["host"], container_port)
