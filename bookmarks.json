@@ -4,5 +4,27 @@
     "/home/comfy/output",
     "/home/comfy/input",
     "/home/comfy/models"
+  ],
+  "ai": [
+    "/home/linkray",
+    "/home/linkray/models",
+    "/home/linkray/custom_nodes",
+    "/home/linkray/output",
+    "/home/linkray/input",
+    "/data/comfy"
+  ],
+  "cinema": [
+    "/home/server"
+  ],
+  "vast": [
+    "/home/comfy/output",
+    "/home/comfy",
+    "/home/comfy/input",
+    "/home/comfy/models"
+  ],
+  "tnr-0": [
+    "/home/ubuntu/ComfyUI/custom_nodes",
+    "/home/ubuntu/ComfyUI/input",
+    "/home/ubuntu/ComfyUI/output"
   ]
 }

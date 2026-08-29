@@ -114,7 +114,7 @@ class SSHConfig:
         self.config_path = Path(config_path).expanduser()
         self.host_info = {}
 
-    def get_host_info(self, host: str = "vast-ai") -> dict[str, str]:
+    def get_host_info(self, host: str = "vast") -> dict[str, str]:
         """Extract host, port, user, and identity file from SSH config"""
         if not self.config_path.exists():
             raise FileNotFoundError(f"SSH config not found at {self.config_path}")
@@ -281,7 +281,7 @@ def resolve_vast_endpoint(
 def resolve_ssh_connection_candidates(
     host_info: dict[str, str], container_port: int = 2222
 ) -> list[ResolvedSSHConnection]:
-    """Resolve SSH routes, preferring a direct Vast.ai endpoint when appropriate."""
+    """Resolve the SSH route for a host."""
     original = {
         "host": host_info["hostname"],
         "port": host_info.get("port", "22"),
@@ -295,7 +295,7 @@ def resolve_ssh_connection_candidates(
         # private or stale forwarded address that is not reachable locally.
         return [original]
 
-    candidates: list[ResolvedSSHConnection] = []
+    candidates: list[ResolvedSSHConnection] = [original]
     if not _should_use_config_route(host_info):
         endpoint = resolve_vast_endpoint(original["host"], container_port)
         if endpoint:
@@ -310,9 +310,7 @@ def resolve_ssh_connection_candidates(
                 mapped["host"] != original["host"]
                 or mapped["port"] != original["port"]
             ):
-                candidates.append(mapped)
-
-    candidates.append(original)
+                candidates.insert(0, mapped)
 
     unique: list[ResolvedSSHConnection] = []
     seen: set[tuple[str, str, str | None, str | None]] = set()

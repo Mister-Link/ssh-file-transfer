@@ -84,7 +84,7 @@ class FileUploader:
 
     def probe_connection(self) -> None:
         """Verify that this SSH route accepts a command."""
-        cmd = shlex.split(self._build_ssh_args()) + [self.ssh_target or f"{self.user}@{self.host}", "true"]
+        cmd = shlex.split(self._build_ssh_args()) + [self.ssh_target or f"{self.user}@{self.host}", "echo 1"]
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30 if self.proxycommand else 10)
         except subprocess.CalledProcessError as e:
@@ -225,7 +225,7 @@ Examples:
   %(prog)s myfolder/                     # Upload entire folder
   %(prog)s myfile.txt -r uploads/        # Upload to /home/user/uploads/
   %(prog)s . -r project/ -e node_modules -e .git  # Upload current dir, exclude patterns
-  %(prog)s myfile.txt --host vast-ai     # Specify different SSH config host
+  %(prog)s myfile.txt --host vast        # Specify different SSH config host
         """,
     )
 
@@ -237,7 +237,7 @@ Examples:
         help="Remote subdirectory (relative to /home/user/)",
     )
     _ = parser.add_argument(
-        "--host", default="vast-ai", help="SSH config host name (default: vast-ai)"
+        "--host", default="vast", help="SSH config host name (default: vast)"
     )
     _ = parser.add_argument(
         "-e",

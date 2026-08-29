@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from threading import RLock
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TypedDict
@@ -959,6 +960,10 @@ class FileUploader:
         self.proxycommand = self._normalize_proxycommand(proxycommand)
         self.ssh_target = ssh_target
         self.os_type = os_type
+        # A remote SSH endpoint may reject bursts of forwarded connections.
+        # The GUI can create one worker per selected item, so serialize the
+        # actual SSH transfers while keeping the UI workers responsive.
+        self._transfer_lock = RLock()
 
     def _normalize_proxycommand(self, proxycommand: str | None) -> str | None:
         if not proxycommand:
@@ -987,6 +992,7 @@ class FileUploader:
                 ssh_args += f" -i {self.identity}"
         ssh_args += (
             " -o StrictHostKeyChecking=no -o BatchMode=yes"
+            " -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
             " -o Compression=no -o Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com"
         )
         if self.proxycommand:
@@ -1003,8 +1009,9 @@ class FileUploader:
         import shlex
 
         ssh_cmd = shlex.split(self._build_ssh_args())
+        target = self.ssh_target or f"{self.user}@{self.host}"
         cmd = ssh_cmd + [
-            f"{self.user}@{self.host}",
+            target,
             "command -v rsync >/dev/null 2>&1 || "
             "(sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y rsync) || "
             "(apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y rsync)",
@@ -1208,14 +1215,14 @@ class FileUploader:
         local_dest_path = Path(local_dest)
         local_dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._ensure_remote_rsync(progress_callback)
-
-        source = f"{self.user}@{self.host}:{remote_path}"
+        target = self.ssh_target or f"{self.user}@{self.host}"
+        source = f"{target}:{remote_path}"
         if is_dir:
             source = f"{source.rstrip('/')}/"
         cmd = [
             "rsync",
             "-av",
+            "--partial",
             "--info=progress2",
             "--skip-compress=png,jpg,jpeg,webp,gif,mp4,mkv,zip,7z",
             "-e",
@@ -1224,18 +1231,43 @@ class FileUploader:
             str(local_dest_path),
         ]
 
-        try:
-            if progress_callback:
-                progress_callback(None, f"Downloading {Path(remote_path).name}...")
-            _ = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            if progress_callback:
-                progress_callback(True, f"✅ Downloaded {Path(remote_path).name}")
-            return True
-        except subprocess.CalledProcessError as e:
-            err = e.stderr or ""
-            if progress_callback:
-                progress_callback(False, f"❌ Download failed: {err}")
-            return False
+        # Multiple GUI download workers otherwise open a connection burst to
+        # the same forwarded SSH port. Retry only connection-level failures;
+        # bad paths and permissions should still fail immediately.
+        transient_markers = (
+            "kex_exchange_identification",
+            "ssh_exchange_identification",
+            "connection reset by peer",
+            "connection closed by",
+            "rsync: connection unexpectedly closed",
+        )
+        max_attempts = 3
+
+        with self._transfer_lock:
+            self._ensure_remote_rsync(progress_callback)
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    if progress_callback:
+                        suffix = "" if attempt == 1 else f" (retry {attempt - 1}/{max_attempts - 1})"
+                        progress_callback(None, f"Downloading {Path(remote_path).name}...{suffix}")
+                    _ = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    if progress_callback:
+                        progress_callback(True, f"✅ Downloaded {Path(remote_path).name}")
+                    return True
+                except subprocess.CalledProcessError as e:
+                    err = (e.stderr or e.stdout or "").strip()
+                    is_transient = any(marker in err.lower() for marker in transient_markers)
+                    if not is_transient or attempt == max_attempts:
+                        if progress_callback:
+                            progress_callback(False, f"❌ Download failed: {err}")
+                        return False
+                    if progress_callback:
+                        progress_callback(None, "SSH connection reset; retrying shortly...")
+                    import time
+
+                    time.sleep(attempt)
+
+        return False
 
 
 class UploadWorker(QtCore.QThread):
@@ -2001,12 +2033,15 @@ class UploaderWindow(QtWidgets.QMainWindow):
             all_hosts = hosts + s3_hosts
             self.host_combo.addItems(all_hosts)
             if all_hosts:
-                # Try to select "ai" by default, otherwise use first host
-                try:
-                    ai_index = all_hosts.index("ai")
-                    self.host_combo.setCurrentIndex(ai_index)
-                except ValueError:
-                    self.host_combo.setCurrentIndex(0)
+                preferred_hosts = ("vast", "vast-ai", "ai")
+                selected_index = 0
+                for preferred_host in preferred_hosts:
+                    try:
+                        selected_index = all_hosts.index(preferred_host)
+                        break
+                    except ValueError:
+                        continue
+                self.host_combo.setCurrentIndex(selected_index)
                 self.connect_to_host()
         except Exception as e:
             self.log_box.appendPlainText(f"Error loading hosts: {e}")
